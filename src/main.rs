@@ -331,39 +331,101 @@ fn main() {
                 let mut agg = vec![[0i64; 4]; (ncamp + 1) * ndays];
                 let mut out = UserOut::default();
                 let mut st = PersonState::new(ncamp, cats.len());
-                let mut ev: Vec<u128> = Vec::new();
+                let mut lm = LocalMap::new();
+                let mut names: Vec<u64> = Vec::new();
+                let mut off: Vec<u32> = Vec::new();
+                let mut coff: Vec<u32> = Vec::new();
+                let mut ids: Vec<u32> = Vec::new();
+                let mut cids: Vec<u32> = Vec::new();
+                let mut ev: Vec<u64> = Vec::new();
                 let mut cl: Vec<Click> = Vec::new();
                 loop {
                     let p = next.fetch_add(1, Ordering::Relaxed);
                     if p >= nparts {
                         break;
                     }
-                    ev.clear();
-                    cl.clear();
+                    let n: usize = ev_parts.iter().map(|t| t[p].len()).sum();
+                    if n == 0 {
+                        continue;
+                    }
+                    // Dense person numbers within the partition, then a counting sort by person.
+                    lm.reset(n / 4);
+                    names.clear();
+                    off.clear();
+                    ids.clear();
                     for t in ev_parts.iter() {
-                        ev.extend(t[p].iter().map(|r| ((r[0] as u128) << 64) | r[1] as u128));
+                        for r in &t[p] {
+                            let id = lm.get_or_insert(r[0], &mut names);
+                            if id as usize == off.len() {
+                                off.push(0);
+                            }
+                            off[id as usize] += 1;
+                            ids.push(id);
+                        }
                     }
+                    let np = names.len();
+                    let mut acc = 0u32;
+                    for o in off.iter_mut() {
+                        let c = *o;
+                        *o = acc;
+                        acc += c;
+                    }
+                    off.push(acc);
+                    ev.clear();
+                    ev.resize(n, 0);
+                    let mut i = 0;
+                    for t in ev_parts.iter() {
+                        for r in &t[p] {
+                            let id = ids[i] as usize;
+                            i += 1;
+                            ev[off[id] as usize] = r[1];
+                            off[id] += 1;
+                        }
+                    }
+                    // off[id] is now the end of person id, which is the start of id + 1.
+                    coff.clear();
+                    coff.resize(np + 1, 0);
+                    cids.clear();
                     for t in cl_parts.iter() {
-                        cl.extend_from_slice(&t[p]);
+                        for c in &t[p] {
+                            let id = lm.get(c.user);
+                            cids.push(id);
+                            if id != u32::MAX {
+                                coff[id as usize] += 1;
+                            }
+                        }
                     }
-                    ev.sort_unstable();
-                    cl.sort_unstable_by_key(|c| (c.user, c.ts, c.ckey));
-                    let (mut i, mut ci) = (0usize, 0usize);
-                    while i < ev.len() {
-                        let name = (ev[i] >> 64) as u64;
-                        let mut j = i + 1;
-                        while j < ev.len() && (ev[j] >> 64) as u64 == name {
-                            j += 1;
+                    let mut acc = 0u32;
+                    for o in coff.iter_mut() {
+                        let c = *o;
+                        *o = acc;
+                        acc += c;
+                    }
+                    cl.clear();
+                    cl.resize(acc as usize, Click { user: 0, ckey: 0, ts: 0, camp: 0 });
+                    let mut i = 0;
+                    for t in cl_parts.iter() {
+                        for c in &t[p] {
+                            let id = cids[i];
+                            i += 1;
+                            if id != u32::MAX {
+                                cl[coff[id as usize] as usize] = *c;
+                                coff[id as usize] += 1;
+                            }
                         }
-                        while ci < cl.len() && cl[ci].user < name {
-                            ci += 1;
+                    }
+                    let (mut es, mut cs) = (0usize, 0usize);
+                    for id in 0..np {
+                        let (ee, ce) = (off[id] as usize, coff[id] as usize);
+                        let e = &mut ev[es..ee];
+                        e.sort_unstable();
+                        let c = &mut cl[cs..ce];
+                        if c.len() > 1 {
+                            c.sort_unstable_by_key(|c| (c.ts, c.ckey));
                         }
-                        let cs = ci;
-                        while ci < cl.len() && cl[ci].user == name {
-                            ci += 1;
-                        }
-                        st.person(name, &ev[i..j], &cl[cs..ci], ws, day0, ndays, ncamp, &mut agg, &mut out);
-                        i = j;
+                        st.person(names[id], e, c, ws, day0, ndays, ncamp, &mut agg, &mut out);
+                        es = ee;
+                        cs = ce;
                     }
                 }
                 let n = out.day.len();
@@ -446,6 +508,75 @@ fn write_user_file(out_dir: &Path, tid: usize, out: &UserOut, cats: &[Vec<u8>]) 
     );
 }
 
+/// Person name to dense number within one partition.
+struct LocalMap {
+    keys: Vec<u64>,
+    ids: Vec<u32>,
+    mask: usize,
+}
+impl LocalMap {
+    fn new() -> Self {
+        LocalMap { keys: Vec::new(), ids: Vec::new(), mask: 0 }
+    }
+    fn reset(&mut self, hint: usize) {
+        let cap = hint.max(64).next_power_of_two();
+        self.keys.clear();
+        self.keys.resize(cap, 0);
+        self.ids.clear();
+        self.ids.resize(cap, 0);
+        self.mask = cap - 1;
+    }
+    #[inline(always)]
+    fn slot(&self, k: u64) -> usize {
+        (mix(k) >> 6) as usize & self.mask
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> u32 {
+        let mut i = self.slot(k);
+        loop {
+            let c = self.keys[i];
+            if c == k {
+                return self.ids[i];
+            }
+            if c == 0 {
+                return u32::MAX;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn get_or_insert(&mut self, k: u64, names: &mut Vec<u64>) -> u32 {
+        let mut i = self.slot(k);
+        loop {
+            let c = self.keys[i];
+            if c == k {
+                return self.ids[i];
+            }
+            if c == 0 {
+                break;
+            }
+            i = (i + 1) & self.mask;
+        }
+        let id = names.len() as u32;
+        names.push(k);
+        if names.len() * 2 > self.mask + 1 {
+            self.reset((self.mask + 1) * 2);
+            for (j, &nk) in names.iter().enumerate() {
+                let mut i = self.slot(nk);
+                while self.keys[i] != 0 {
+                    i = (i + 1) & self.mask;
+                }
+                self.keys[i] = nk;
+                self.ids[i] = j as u32;
+            }
+        } else {
+            self.keys[i] = k;
+            self.ids[i] = id;
+        }
+        id
+    }
+}
+
 struct PersonState {
     cnt: Vec<u32>,
     active: Vec<u32>,
@@ -494,7 +625,7 @@ impl PersonState {
     fn person(
         &mut self,
         name: u64,
-        ev: &[u128],
+        ev: &[u64],
         cl: &[Click],
         ws: i64,
         day0: i64,
@@ -511,7 +642,7 @@ impl PersonState {
         let m = ev.len();
         let mut k = 0;
         while k < m {
-            let start = (ev[k] as u64) >> 32;
+            let start = ev[k] >> 32;
             let day = (ws + start as i64).div_euclid(DAY_MS);
             if day != cur_day {
                 self.flush(cur_day, d_sessions, d_events, d_rev, out);
@@ -524,7 +655,7 @@ impl PersonState {
             let mut rev = 0i64;
             let mut n = 0i32;
             while k < m {
-                let w = ev[k] as u64;
+                let w = ev[k];
                 let ts = w >> 32;
                 if ts - prev > GAP_MS {
                     break;
