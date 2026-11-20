@@ -195,7 +195,11 @@ fn main() {
     let mut clicks_by_thread: Vec<Vec<Click>> = Vec::new();
     let mut resolve: KMap<u64> = KMap::with_capacity(0);
     std::thread::scope(|sc| {
-        let link_handle = sc.spawn(|| build_links(&ln_files));
+        let link_handle = sc.spawn(|| {
+            let r = build_links(&ln_files);
+            lap("links");
+            r
+        });
         let mut hs = Vec::new();
         for _ in 0..nthreads {
             hs.push(sc.spawn(|| {
@@ -219,6 +223,7 @@ fn main() {
                         ev_counts[ci].store(n, Ordering::Relaxed);
                     }
                 }
+                lap("worker");
                 (dups, clicks)
             }));
         }
@@ -417,6 +422,11 @@ fn main() {
         ],
     );
     lap("done");
+    if verbose {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        eprintln!("maxrss {} (KB on Linux), minflt {}, majflt {}", ru.ru_maxrss, ru.ru_minflt, ru.ru_majflt);
+    }
     // Skip destructors and unmapping: the kernel reclaims everything at exit.
     unsafe { libc::_exit(0) };
 }
