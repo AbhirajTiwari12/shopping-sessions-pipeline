@@ -1129,4 +1129,4 @@ pub fn prefault_read(p: *const u8, len: usize) {
     }
     let _ = (p, len);
 }
-pub const DEFAULT_PREFAULT: bool = true;
+pub const DEFAULT_PREFAULT: bool = false;
