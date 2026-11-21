@@ -1673,4 +1673,4 @@ fn small_output() -> bool {
     *V.get_or_init(|| std::env::var("SMALL_OUT").map_or(DEFAULT_SMALL_OUT, |v| v != "0"))
 }
 
-const DEFAULT_THREAD_DIV: usize = 2;
+const DEFAULT_THREAD_DIV: usize = 1;
