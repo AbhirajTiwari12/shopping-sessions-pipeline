@@ -1323,8 +1323,9 @@ struct Pending {
 /// Resolves the row's person, writes it to its partition and enters it in the dedup table.
 #[inline(always)]
 unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending) {
+    let stage = stage_limit();
     let (name, p) = if pe.w != DEAD_W {
-        let name = links.get(pe.user);
+        let name = if stage == 5 || stage == 6 { pe.user } else { links.get(pe.user) };
         (name, (h1(name) >> st.pshift) as usize)
     } else {
         (0, st.nparts)
@@ -1346,6 +1347,9 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
     // The next line of this partition's stream, so the store never waits on a miss.
     prefetch_w(st.rows.p().add(idx + 2));
     st.inserted += 1;
+    if stage == 4 || stage == 6 {
+        return;
+    }
     let loc = t.loc_base | idx as u32;
     let tag = pe.tag & t.tag_mask;
     let val = ((tag as u64) << 32) | (loc as u64 + 1);
