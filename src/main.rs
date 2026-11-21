@@ -1330,8 +1330,8 @@ unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &Tabl
     let d = m.ptr;
     let mut dc = DateCache::new();
     let mut n = 0usize;
-    const RING: usize = 16;
-    let mut ring = [Pending { key: 0, user: 0, w: 0, slot: 0, tag: 0, ingest: 0 }; RING];
+    let ring_n = ring_size();
+    let mut ring = [Pending { key: 0, user: 0, w: 0, slot: 0, tag: 0, ingest: 0 }; 64];
     let (ws, we) = (ctx.ws, ctx.we);
     scan_lines(d, m.len, c.start, c.end, |ls, commas, nf, nl, qc| {
         let Some(f) = fields::<7>(d, ls, commas, nf, nl, qc) else { return };
@@ -1380,14 +1380,20 @@ unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &Tabl
             links.prefetch(pe.user);
             pe.w = (((ts - ws) as u64) << 32) | extra as u64;
         }
-        let r = n % RING;
-        if n >= RING {
+        let r = n & (ring_n - 1);
+        if n >= ring_n {
             commit(st, t, links, ring[r]);
         }
         ring[r] = pe;
         n += 1;
     });
-    for i in 0..n.min(RING) {
+    for i in 0..n.min(ring_n) {
         commit(st, t, links, ring[i]);
     }
+}
+
+/// How many lines ahead the table and link slots are prefetched.
+fn ring_size() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("RING").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| n.is_power_of_two() && *n <= 64).unwrap_or(16))
 }
