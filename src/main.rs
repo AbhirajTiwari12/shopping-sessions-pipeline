@@ -427,6 +427,13 @@ fn main() {
     let (ev_chunks, ev_bytes) = cut(&ev_files, CHUNK);
     let (cl_chunks, cl_bytes) = cut(&cl_files, CHUNK);
     let (ln_chunks, _) = cut(&ln_files, 1 << 20);
+    // A row's location packs (thread, index) in 32 bits: with very large inputs, use
+    // fewer threads rather than run out of index bits.
+    let nthreads = {
+        let need = 64 - ((ev_bytes / 28 + 16 + 130 * BLK + 2) as u64).leading_zeros();
+        assert!(need <= 31, "too many events for this build");
+        nthreads.min(1usize << (32 - need))
+    };
     // Ask the kernel to start reading everything now, in the order it will be parsed.
     #[cfg(target_os = "linux")]
     if std::env::var("NO_READAHEAD").is_err() {
@@ -482,7 +489,7 @@ fn main() {
     // Rows go straight into their person's partition: blocks of BLK rows in one lazily
     // committed array per thread. A row's location is (thread, index) in 32 bits.
     let row_cap = rec_bound + (nparts + 2) * BLK;
-    let tb = nthreads.next_power_of_two().trailing_zeros();
+    let tb = nthreads.next_power_of_two().trailing_zeros().max(1);
     let lshift = 32 - tb;
     assert!((row_cap as u64) + 1 < (1u64 << lshift), "too many events for this build");
     let lmask = (1u32 << lshift) - 1;

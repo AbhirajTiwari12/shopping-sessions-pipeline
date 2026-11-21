@@ -428,9 +428,11 @@ unsafe fn parse_dt19(p: *const u8, dc: &mut DateCache) -> Option<i64> {
         return None;
     }
     let d = x & 0x0F0F_000F_0F00_0F0F;
-    let h = (d & 15) * 10 + ((d >> 8) & 15);
-    let m = ((d >> 24) & 15) * 10 + ((d >> 32) & 15);
-    let s = ((d >> 48) & 15) * 10 + ((d >> 56) & 15);
+    // Tens times ten plus ones for all three pairs at once: bytes 0, 3 and 6.
+    let y = d.wrapping_mul(10) + (d >> 8);
+    let h = y & 0xFF;
+    let m = (y >> 24) & 0xFF;
+    let s = (y >> 48) & 0xFF;
     if h > 23 || m > 59 || s > 59 {
         return None;
     }
