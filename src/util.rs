@@ -953,7 +953,7 @@ macro_rules! field {
 /// are wrapped in quotes: the line is well formed when its quotes are exactly twice that.
 /// Whether `split_fields` uses a vector gather. Gathers are slow on some CPUs (and
 /// mitigations make them slower on others), so the scalar walk is the default.
-pub const USE_GATHER: bool = true;
+pub const USE_GATHER: bool = false;
 
 #[inline(always)]
 pub unsafe fn split_fields<const K: usize>(d: *const u8, seps: *const u32, starts: &mut [u32; 8], lens: &mut [u32; 8]) -> u32 {

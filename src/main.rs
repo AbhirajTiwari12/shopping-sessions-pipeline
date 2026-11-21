@@ -1623,7 +1623,7 @@ unsafe fn parse_events_ring(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: 
 
 /// Which line scanner parses events and clicks: the batched two-stage one, or the
 /// simpler one that handles each line as its separators are found. SCAN=batch / SCAN=ring.
-const DEFAULT_RING: bool = false;
+const DEFAULT_RING: bool = true;
 fn use_ring() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| match std::env::var("SCAN") {
