@@ -1368,6 +1368,11 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
         let slot = &*t.table.p().add(i);
         let mut cur = slot.load(Ordering::Acquire);
         if cur == 0 {
+            if stage_limit() == 9 {
+                // Timing experiment only: not safe with more than one thread.
+                slot.store(val, Ordering::Relaxed);
+                return;
+            }
             match slot.compare_exchange(0, val, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return,
                 Err(x) => cur = x,
