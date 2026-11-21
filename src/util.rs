@@ -48,6 +48,9 @@ pub fn map_file(path: &std::path::Path) -> Map {
 
 /// Zeroed, lazily committed anonymous memory for `n` values of `T`.
 pub fn alloc_zeroed<T>(n: usize) -> *mut T {
+    alloc_zeroed_opt(n, true)
+}
+pub fn alloc_zeroed_opt<T>(n: usize, huge: bool) -> *mut T {
     let bytes = (n.max(1) * std::mem::size_of::<T>() + 0x1F_FFFF) & !0x1F_FFFF;
     unsafe {
         let p = libc::mmap(
@@ -60,9 +63,16 @@ pub fn alloc_zeroed<T>(n: usize) -> *mut T {
         );
         assert!(p != libc::MAP_FAILED, "mmap anon rw");
         #[cfg(target_os = "linux")]
-        libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+        if huge && !no_huge() {
+            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+        }
+        let _ = huge;
         p as *mut T
     }
+}
+pub fn no_huge() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NO_HUGE").is_ok())
 }
 #[cfg(target_os = "linux")]
 const MAP_NORESERVE: i32 = libc::MAP_NORESERVE;
@@ -206,10 +216,9 @@ pub fn mix(k: u64) -> u64 {
     h
 }
 
-/// Open-addressing map from non-zero u64 keys.
+/// Open-addressing map from non-zero u64 keys; key and value share a cache line.
 pub struct KMap<V: Copy + Default> {
-    pub keys: Vec<u64>,
-    pub vals: Vec<V>,
+    pub e: Vec<(u64, V)>,
     pub shift: u32,
     pub mask: usize,
     pub len: usize,
@@ -217,13 +226,7 @@ pub struct KMap<V: Copy + Default> {
 impl<V: Copy + Default> KMap<V> {
     pub fn with_capacity(n: usize) -> Self {
         let cap = (n.max(8) * 2).next_power_of_two();
-        KMap {
-            keys: vec![0; cap],
-            vals: vec![V::default(); cap],
-            shift: 64 - cap.trailing_zeros(),
-            mask: cap - 1,
-            len: 0,
-        }
+        KMap { e: vec![(0, V::default()); cap], shift: 64 - cap.trailing_zeros(), mask: cap - 1, len: 0 }
     }
     #[inline(always)]
     pub fn slot(&self, k: u64) -> usize {
@@ -231,17 +234,17 @@ impl<V: Copy + Default> KMap<V> {
     }
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
-        prefetch(unsafe { self.keys.as_ptr().add(self.slot(k)) });
+        prefetch(unsafe { self.e.as_ptr().add(self.slot(k)) });
     }
     #[inline(always)]
     pub fn get(&self, k: u64) -> Option<V> {
         let mut i = self.slot(k);
         loop {
-            let c = unsafe { *self.keys.get_unchecked(i) };
-            if c == k {
-                return Some(unsafe { *self.vals.get_unchecked(i) });
+            let c = unsafe { *self.e.get_unchecked(i) };
+            if c.0 == k {
+                return Some(c.1);
             }
-            if c == 0 {
+            if c.0 == 0 {
                 return None;
             }
             i = (i + 1) & self.mask;
@@ -253,18 +256,41 @@ impl<V: Copy + Default> KMap<V> {
         debug_assert!(self.len * 2 <= self.mask + 1);
         let mut i = self.slot(k);
         loop {
-            let c = self.keys[i];
-            if c == k {
-                return self.vals[i];
+            let c = unsafe { *self.e.get_unchecked(i) };
+            if c.0 == k {
+                return c.1;
             }
-            if c == 0 {
-                self.keys[i] = k;
-                self.vals[i] = v;
+            if c.0 == 0 {
+                self.e[i] = (k, v);
                 self.len += 1;
                 return v;
             }
             i = (i + 1) & self.mask;
         }
+    }
+}
+
+/// A fixed-capacity, lazily committed buffer: pushing never reallocates.
+pub struct Arena<T> {
+    pub ptr: *mut T,
+    pub len: usize,
+    pub cap: usize,
+}
+unsafe impl<T> Send for Arena<T> {}
+unsafe impl<T> Sync for Arena<T> {}
+impl<T> Arena<T> {
+    pub fn new(cap: usize, huge: bool) -> Self {
+        Arena { ptr: alloc_zeroed_opt::<T>(cap, huge), len: 0, cap }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, v: T) {
+        debug_assert!(self.len < self.cap);
+        unsafe { self.ptr.add(self.len).write(v) };
+        self.len += 1;
+    }
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 

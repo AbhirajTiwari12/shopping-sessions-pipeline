@@ -37,7 +37,23 @@ struct Chunk {
     file: usize,
     start: usize,
     end: usize,
-    base: usize,
+}
+
+/// Rows of one thread scattered by partition: blocks of BLK rows in one arena.
+const BLK: usize = 256;
+struct Scattered {
+    arena: Arena<[u64; 2]>,
+    lists: Vec<Vec<u32>>,
+    left: Vec<u32>,
+}
+
+struct TableCtx<'a> {
+    table: P<AtomicU64>,
+    mask: usize,
+    tshift: u32,
+    bases: &'a [P<Rec>],
+    lshift: u32,
+    loc_base: u32,
 }
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -157,127 +173,181 @@ fn main() {
     let ev_files: Vec<Map> = list_csv(&data_dir.join("events")).iter().map(|p| map_file(p)).collect();
     let cl_files: Vec<Map> = list_csv(&data_dir.join("clicks")).iter().map(|p| map_file(p)).collect();
     let ln_files: Vec<Map> = list_csv(&data_dir.join("links")).iter().map(|p| map_file(p)).collect();
-    let mut ev_chunks = Vec::new();
-    let mut base = 0usize;
-    let mut ev_bytes = 0usize;
-    for (fi, m) in ev_files.iter().enumerate() {
-        ev_bytes += m.len;
-        let mut s = 0;
-        while s < m.len {
-            let e = (s + CHUNK).min(m.len);
-            ev_chunks.push(Chunk { file: fi, start: s, end: e, base });
-            base += (e - s) / 28 + 2;
-            s = e;
+    let cut = |files: &[Map]| -> (Vec<Chunk>, usize) {
+        let mut chunks = Vec::new();
+        let mut bytes = 0usize;
+        for (fi, m) in files.iter().enumerate() {
+            bytes += m.len;
+            let mut s = 0;
+            while s < m.len {
+                let e = (s + CHUNK).min(m.len);
+                chunks.push(Chunk { file: fi, start: s, end: e });
+                s = e;
+            }
         }
+        (chunks, bytes)
+    };
+    let (ev_chunks, ev_bytes) = cut(&ev_files);
+    let (cl_chunks, cl_bytes) = cut(&cl_files);
+
+    // Event records live in one lazily committed array per thread; a record's location
+    // is (thread, index) packed in 32 bits. A valid event line has at least 28 bytes.
+    let rec_bound = ev_bytes / 28 + 16;
+    let tb = nthreads.next_power_of_two().trailing_zeros();
+    let lshift = 32 - tb;
+    assert!((rec_bound as u64) + 1 < (1u64 << lshift), "too many events for this build");
+    let mut rec_arenas: Vec<Arena<Rec>> = (0..nthreads).map(|_| Arena::new(rec_bound, true)).collect();
+    let bases: Vec<P<Rec>> = rec_arenas.iter().map(|a| P(a.ptr)).collect();
+    let mut click_arenas: Vec<Arena<Click>> = (0..nthreads).map(|_| Arena::new(cl_bytes / 8 + 16, false)).collect();
+
+    // Dedup table size: from the sampled line length, never more than the guaranteed bound.
+    let (mut sample_bytes, mut sample_lines) = (0usize, 0usize);
+    for m in &ev_files {
+        let n = m.len.min(16 << 10);
+        let sl = unsafe { std::slice::from_raw_parts(m.ptr, n) };
+        sample_bytes += n;
+        sample_lines += sl.iter().filter(|&&b| b == b'\n').count();
     }
-    let rec_cap = base;
-    assert!(rec_cap < (u32::MAX - 1) as usize, "too many events for this build");
-    let mut cl_chunks = Vec::new();
-    for (fi, m) in cl_files.iter().enumerate() {
-        let mut s = 0;
-        while s < m.len {
-            let e = (s + CHUNK).min(m.len);
-            cl_chunks.push(Chunk { file: fi, start: s, end: e, base: 0 });
-            s = e;
-        }
+    let bits = |n: usize| n.max(1024).next_power_of_two().trailing_zeros();
+    let g_bits = bits(rec_bound + rec_bound / 8);
+    let est = if sample_bytes > 0 { (ev_bytes as f64 * sample_lines as f64 / sample_bytes as f64 * 1.05) as usize } else { 0 };
+    let chunk_lines = CHUNK / 28 + 2;
+    let min_bits = bits(nthreads * chunk_lines * 6);
+    let mut tbits = g_bits.min(bits((est as f64 / 0.7) as usize).max(min_bits));
+    if let Some(f) = std::env::var("FORCE_TBITS").ok().and_then(|v| v.parse::<u32>().ok()) {
+        tbits = f.min(g_bits);
     }
-    let recs = P(alloc_zeroed::<Rec>(rec_cap));
-    // At most ev_bytes / 28 records; the table holds at least 1.4 times that.
-    let tbits = (((ev_bytes / 20).max(1024)).next_power_of_two()).trailing_zeros();
-    let table = P(alloc_zeroed::<AtomicU64>(1usize << tbits));
-    let ev_counts: Vec<AtomicUsize> = ev_chunks.iter().map(|_| AtomicUsize::new(0)).collect();
+    if verbose {
+        eprintln!("est {est} bound {rec_bound} tbits {tbits} g_bits {g_bits}");
+    }
     lap("setup");
 
     // Phase 1: parse events and clicks on the workers, links on their own thread.
-    let next = AtomicUsize::new(0);
     let njobs = ev_chunks.len() + cl_chunks.len();
     let mut dups: Vec<(u32, u32)> = Vec::new();
-    let mut clicks_by_thread: Vec<Vec<Click>> = Vec::new();
     let mut resolve: KMap<u64> = KMap::with_capacity(0);
-    std::thread::scope(|sc| {
-        let link_handle = sc.spawn(|| {
-            let r = build_links(&ln_files);
-            lap("links");
-            r
+    loop {
+        let slots = 1usize << tbits;
+        let table = P(alloc_zeroed::<AtomicU64>(slots));
+        let limit = if tbits >= g_bits { usize::MAX } else { slots / 5 * 4 };
+        let inserted = AtomicUsize::new(0);
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let next = AtomicUsize::new(0);
+        dups.clear();
+        std::thread::scope(|sc| {
+            let link_handle = sc.spawn(|| {
+                let r = build_links(&ln_files);
+                lap("links");
+                r
+            });
+            let mut hs = Vec::new();
+            for (tid, (ra, ca)) in rec_arenas.iter_mut().zip(click_arenas.iter_mut()).enumerate() {
+                let (ctx, ev_chunks, cl_chunks, ev_files, cl_files, bases, next, inserted, abort) =
+                    (&ctx, &ev_chunks, &cl_chunks, &ev_files, &cl_files, &bases, &next, &inserted, &abort);
+                hs.push(sc.spawn(move || {
+                    let mut dups: Vec<(u32, u32)> = Vec::new();
+                    ra.len = 0;
+                    ca.len = 0;
+                    let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, bases, lshift, loc_base: (tid as u32) << lshift };
+                    loop {
+                        let j = next.fetch_add(1, Ordering::Relaxed);
+                        if j >= njobs || abort.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if j < cl_chunks.len() {
+                            let c = &cl_chunks[j];
+                            unsafe { parse_clicks(ctx, &cl_files[c.file], c, ca) };
+                        } else {
+                            let c = &ev_chunks[j - cl_chunks.len()];
+                            let before = ra.len;
+                            unsafe { parse_events(ctx, &ev_files[c.file], c, ra, &tctx, &mut dups) };
+                            let n = ra.len - before;
+                            if inserted.fetch_add(n, Ordering::Relaxed) + n > limit {
+                                abort.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    lap("worker");
+                    dups
+                }));
+            }
+            for h in hs {
+                dups.extend_from_slice(&h.join().unwrap());
+            }
+            resolve = link_handle.join().unwrap();
         });
-        let mut hs = Vec::new();
-        for _ in 0..nthreads {
-            hs.push(sc.spawn(|| {
-                let mut dups: Vec<(u32, u32)> = Vec::new();
-                let mut clicks: Vec<Click> = Vec::new();
-                loop {
-                    let j = next.fetch_add(1, Ordering::Relaxed);
-                    if j >= njobs {
-                        break;
-                    }
-                    // Largest inputs (events) last so clicks are out of the way early.
-                    if j < cl_chunks.len() {
-                        let c = &cl_chunks[j];
-                        let m = &cl_files[c.file];
-                        unsafe { parse_clicks(&ctx, m, c, &mut clicks) };
-                    } else {
-                        let ci = j - cl_chunks.len();
-                        let c = &ev_chunks[ci];
-                        let m = &ev_files[c.file];
-                        let n = unsafe { parse_events(&ctx, m, c, recs, table, tbits, &mut dups) };
-                        ev_counts[ci].store(n, Ordering::Relaxed);
-                    }
-                }
-                lap("worker");
-                (dups, clicks)
-            }));
+        if !abort.load(Ordering::Relaxed) {
+            break;
         }
-        for h in hs {
-            let (d, c) = h.join().unwrap();
-            dups.extend_from_slice(&d);
-            clicks_by_thread.push(c);
-        }
-        resolve = link_handle.join().unwrap();
-    });
+        // The estimate was too low: start over with a bigger table.
+        unsafe { libc::munmap(table.p() as *mut libc::c_void, slots * 8) };
+        tbits += 1;
+        lap("table too small, retrying");
+    }
     lap("parse");
 
     // Dedup: the first copy seen represents the event; it takes the values of the
     // copy with the smallest ingest_ts, and the others die.
+    let lmask = (1u32 << lshift) - 1;
+    let rec_at = |loc: u32| -> *mut Rec { unsafe { bases[(loc >> lshift) as usize].p().add((loc & lmask) as usize) } };
     unsafe {
         for &(first, me) in &dups {
-            let m = *recs.p().add(me as usize);
-            let r = &mut *recs.p().add(first as usize);
+            let m = *rec_at(me);
+            let r = &mut *rec_at(first);
             if m.ingest < r.ingest {
                 r.ingest = m.ingest;
                 r.user = m.user;
                 r.ts = m.ts;
                 r.extra = m.extra;
             }
-            (*recs.p().add(me as usize)).ts = DEAD;
+            (*rec_at(me)).ts = DEAD;
         }
     }
     lap("dedup");
 
     // Phase 2: resolve each row's person and scatter rows into partitions by person.
-    let total_recs: usize = ev_counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    let total_recs: usize = rec_arenas.iter().map(|a| a.len).sum();
+    let total_clicks: usize = click_arenas.iter().map(|a| a.len).sum();
     let pbits = ((total_recs * 16 / (512 << 10)).max(1).next_power_of_two().trailing_zeros()).clamp(4, 12);
     let nparts = 1usize << pbits;
     let pshift = 64 - pbits;
+    const STEP: usize = 1 << 16;
+    let mut jobs: Vec<(bool, usize, usize, usize)> = Vec::new();
+    for (t, a) in rec_arenas.iter().enumerate() {
+        let mut s = 0;
+        while s < a.len {
+            jobs.push((true, t, s, (s + STEP).min(a.len)));
+            s += STEP;
+        }
+    }
+    for (t, a) in click_arenas.iter().enumerate() {
+        let mut s = 0;
+        while s < a.len {
+            jobs.push((false, t, s, (s + STEP).min(a.len)));
+            s += STEP;
+        }
+    }
     let next = AtomicUsize::new(0);
-    let njobs = ev_chunks.len() + clicks_by_thread.len();
-    let mut ev_parts: Vec<Vec<Vec<[u64; 2]>>> = Vec::new();
+    let mut ev_parts: Vec<Scattered> = Vec::new();
     let mut cl_parts: Vec<Vec<Vec<Click>>> = Vec::new();
     std::thread::scope(|sc| {
         let mut hs = Vec::new();
         for _ in 0..nthreads {
             hs.push(sc.spawn(|| {
-                let cap = total_recs / (nthreads * nparts) * 5 / 4 + 16;
-                let mut ev: Vec<Vec<[u64; 2]>> = (0..nparts).map(|_| Vec::with_capacity(cap)).collect();
-                let mut cl: Vec<Vec<Click>> = (0..nparts).map(|_| Vec::new()).collect();
+                let mut arena: Arena<[u64; 2]> = Arena::new(total_recs + (nparts + 1) * BLK, true);
+                let mut cur: Vec<(*mut [u64; 2], usize)> = vec![(std::ptr::null_mut(), 0); nparts];
+                let mut lists: Vec<Vec<u32>> = (0..nparts).map(|_| Vec::new()).collect();
+                let ccap = total_clicks / (nthreads * nparts) * 3 / 2 + 8;
+                let mut cl: Vec<Vec<Click>> = (0..nparts).map(|_| Vec::with_capacity(ccap)).collect();
                 const B: usize = 32;
                 loop {
                     let j = next.fetch_add(1, Ordering::Relaxed);
-                    if j >= njobs {
+                    if j >= jobs.len() {
                         break;
                     }
-                    if j < ev_chunks.len() {
-                        let n = ev_counts[j].load(Ordering::Relaxed);
-                        let rs = unsafe { std::slice::from_raw_parts(recs.p().add(ev_chunks[j].base), n) };
+                    let (is_ev, t, s, e) = jobs[j];
+                    if is_ev {
+                        let rs = &rec_arenas[t].as_slice()[s..e];
                         for blk in rs.chunks(B) {
                             for r in blk {
                                 if r.ts != DEAD {
@@ -288,12 +358,23 @@ fn main() {
                                 if r.ts != DEAD {
                                     let name = resolve.get(r.user).unwrap_or(r.user);
                                     let p = (mix(name) >> pshift) as usize;
-                                    ev[p].push([name, ((r.ts as u64) << 32) | r.extra as u64]);
+                                    let c = unsafe { cur.get_unchecked_mut(p) };
+                                    if c.1 == 0 {
+                                        lists[p].push(arena.len as u32);
+                                        c.0 = unsafe { arena.ptr.add(arena.len) };
+                                        c.1 = BLK;
+                                        arena.len += BLK;
+                                    }
+                                    unsafe {
+                                        c.0.write([name, ((r.ts as u64) << 32) | r.extra as u64]);
+                                        c.0 = c.0.add(1);
+                                    }
+                                    c.1 -= 1;
                                 }
                             }
                         }
                     } else {
-                        let cs = &clicks_by_thread[j - ev_chunks.len()];
+                        let cs = &click_arenas[t].as_slice()[s..e];
                         for blk in cs.chunks(B) {
                             for c in blk {
                                 resolve.prefetch(c.user);
@@ -306,7 +387,8 @@ fn main() {
                         }
                     }
                 }
-                (ev, cl)
+                let left: Vec<u32> = cur.iter().map(|c| c.1 as u32).collect();
+                (Scattered { arena, lists, left }, cl)
             }));
         }
         for h in hs {
@@ -332,6 +414,7 @@ fn main() {
                 let mut out = UserOut::default();
                 let mut st = PersonState::new(ncamp, cats.len());
                 let mut lm = LocalMap::new();
+                let mut segs: Vec<&[[u64; 2]]> = Vec::new();
                 let mut names: Vec<u64> = Vec::new();
                 let mut off: Vec<u32> = Vec::new();
                 let mut coff: Vec<u32> = Vec::new();
@@ -344,7 +427,15 @@ fn main() {
                     if p >= nparts {
                         break;
                     }
-                    let n: usize = ev_parts.iter().map(|t| t[p].len()).sum();
+                    segs.clear();
+                    for t in ev_parts.iter() {
+                        let l = &t.lists[p];
+                        for (bi, &b) in l.iter().enumerate() {
+                            let len = if bi + 1 == l.len() { BLK - t.left[p] as usize } else { BLK };
+                            segs.push(unsafe { std::slice::from_raw_parts(t.arena.ptr.add(b as usize), len) });
+                        }
+                    }
+                    let n: usize = segs.iter().map(|x| x.len()).sum();
                     if n == 0 {
                         continue;
                     }
@@ -353,8 +444,8 @@ fn main() {
                     names.clear();
                     off.clear();
                     ids.clear();
-                    for t in ev_parts.iter() {
-                        for r in &t[p] {
+                    for t in segs.iter() {
+                        for r in t.iter() {
                             let id = lm.get_or_insert(r[0], &mut names);
                             if id as usize == off.len() {
                                 off.push(0);
@@ -374,8 +465,8 @@ fn main() {
                     ev.clear();
                     ev.resize(n, 0);
                     let mut i = 0;
-                    for t in ev_parts.iter() {
-                        for r in &t[p] {
+                    for t in segs.iter() {
+                        for r in t.iter() {
                             let id = ids[i] as usize;
                             i += 1;
                             ev[off[id] as usize] = r[1];
@@ -734,7 +825,7 @@ impl PersonState {
     }
 }
 
-unsafe fn parse_clicks(ctx: &Ctx, m: &Map, c: &Chunk, out: &mut Vec<Click>) {
+unsafe fn parse_clicks(ctx: &Ctx, m: &Map, c: &Chunk, out: &mut Arena<Click>) {
     let d = m.ptr;
     let mut dc = DateCache::new();
     let lo = ctx.ws - WEEK_MS;
@@ -762,15 +853,16 @@ struct Pending {
     slot: usize,
     tag: u32,
     loc: u32,
+    key: u64,
 }
 
 #[inline(always)]
-unsafe fn table_insert(table: P<AtomicU64>, mask: usize, recs: P<Rec>, pe: Pending, dups: &mut Vec<(u32, u32)>) {
+unsafe fn table_insert(t: &TableCtx, pe: Pending, dups: &mut Vec<(u32, u32)>) {
     let val = ((pe.tag as u64) << 32) | (pe.loc as u64 + 1);
-    let key = (*recs.p().add(pe.loc as usize)).key;
+    let lmask = (1u32 << t.lshift) - 1;
     let mut i = pe.slot;
     loop {
-        let slot = &*table.p().add(i);
+        let slot = &*t.table.p().add(i);
         let mut cur = slot.load(Ordering::Acquire);
         if cur == 0 {
             match slot.compare_exchange(0, val, Ordering::AcqRel, Ordering::Acquire) {
@@ -780,32 +872,24 @@ unsafe fn table_insert(table: P<AtomicU64>, mask: usize, recs: P<Rec>, pe: Pendi
         }
         if (cur >> 32) as u32 == pe.tag {
             let other = (cur as u32) - 1;
-            if (*recs.p().add(other as usize)).key == key {
+            let o = t.bases.get_unchecked((other >> t.lshift) as usize).p().add((other & lmask) as usize);
+            if (*o).key == pe.key {
                 dups.push((other, pe.loc));
                 return;
             }
         }
-        i = (i + 1) & mask;
+        i = (i + 1) & t.mask;
     }
 }
 
-unsafe fn parse_events(
-    ctx: &Ctx,
-    m: &Map,
-    c: &Chunk,
-    recs: P<Rec>,
-    table: P<AtomicU64>,
-    tbits: u32,
-    dups: &mut Vec<(u32, u32)>,
-) -> usize {
+unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, out: &mut Arena<Rec>, t: &TableCtx, dups: &mut Vec<(u32, u32)>) {
     let d = m.ptr;
     let mut dc = DateCache::new();
     let mut n = 0usize;
-    let base = c.base;
-    let mask = (1usize << tbits) - 1;
-    let tshift = 64 - tbits;
+    let base = out.len;
+    let recs = out.ptr;
     const RING: usize = 16;
-    let mut ring = [Pending { slot: 0, tag: 0, loc: 0 }; RING];
+    let mut ring = [Pending { slot: 0, tag: 0, loc: 0, key: 0 }; RING];
     let (ws, we) = (ctx.ws, ctx.we);
     scan_lines(d, m.len, c.start, c.end, |ls, commas, nf, nl, qc| {
         let Some(f) = fields::<7>(d, ls, commas, nf, nl, qc) else { return };
@@ -852,22 +936,22 @@ unsafe fn parse_events(
             rec.ts = (ts - ws) as u32;
             rec.extra = extra;
         }
-        let loc = base + n;
-        *recs.p().add(loc) = rec;
+        let idx = base + n;
+        *recs.add(idx) = rec;
         let h = mix(key);
-        let pe = Pending { slot: (h >> tshift) as usize, tag: h as u32, loc: loc as u32 };
-        prefetch(table.p().add(pe.slot));
+        let pe = Pending { slot: (h >> t.tshift) as usize, tag: h as u32, loc: t.loc_base | idx as u32, key };
+        prefetch(t.table.p().add(pe.slot));
         let r = n % RING;
         if n >= RING {
-            table_insert(table, mask, recs, ring[r], dups);
+            table_insert(t, ring[r], dups);
         }
         ring[r] = pe;
         n += 1;
     });
     for i in 0..n.min(RING) {
-        table_insert(table, mask, recs, ring[i], dups);
+        table_insert(t, ring[i], dups);
     }
-    n
+    out.len = base + n;
 }
 
 /// Reads the links and returns, for every ID whose person has another name, that name.
