@@ -1055,6 +1055,8 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
     c.0 += 1;
     c.1 -= 1;
     st.rows.p().add(idx).write(Row { name, w: pe.w, key: pe.key, ingest: pe.ingest, best: 0 });
+    // The next line of this partition's stream, so the store never waits on a miss.
+    prefetch_w(st.rows.p().add(idx + 2));
     st.inserted += 1;
     let loc = t.loc_base | idx as u32;
     let val = ((pe.tag as u64) << 32) | (loc as u64 + 1);
