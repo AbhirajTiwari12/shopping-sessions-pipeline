@@ -48,7 +48,10 @@ struct EvState {
     lists: Vec<Vec<u32>>,
     dups: Vec<(u32, u32)>,
     inserted: usize,
-    clicks: Vec<Vec<Click>>,
+    crows: P<Click>,
+    cused: usize,
+    ccur: Vec<(usize, usize)>,
+    clists: Vec<Vec<u32>>,
     nparts: usize,
     pshift: u32,
 }
@@ -58,7 +61,9 @@ struct ThreadOut {
     lists: Vec<Vec<u32>>,
     left: Vec<u32>,
     dups: Vec<(u32, u32)>,
-    clicks: Vec<Vec<Click>>,
+    crows: P<Click>,
+    clists: Vec<Vec<u32>>,
+    cleft: Vec<u32>,
 }
 
 struct TableCtx<'a> {
@@ -377,7 +382,7 @@ fn main() {
         (chunks, bytes)
     };
     let (ev_chunks, ev_bytes) = cut(&ev_files, CHUNK);
-    let (cl_chunks, _cl_bytes) = cut(&cl_files, CHUNK);
+    let (cl_chunks, cl_bytes) = cut(&cl_files, CHUNK);
     let (ln_chunks, _) = cut(&ln_files, 1 << 20);
     // Ask the kernel to start reading everything now, in the order it will be parsed.
     #[cfg(target_os = "linux")]
@@ -462,7 +467,10 @@ fn main() {
                         lists: (0..nparts + 1).map(|_| Vec::new()).collect(),
                         dups: Vec::new(),
                         inserted: 0,
-                        clicks: (0..nparts).map(|_| Vec::new()).collect(),
+                        crows: P(alloc_zeroed::<Click>(cl_bytes / 8 + 16 + (nparts + 1) * BLK)),
+                        cused: 0,
+                        ccur: vec![(0, 0); nparts],
+                        clists: (0..nparts).map(|_| Vec::new()).collect(),
                         nparts,
                         pshift,
                     };
@@ -491,7 +499,9 @@ fn main() {
                         left: st.cur.iter().map(|c| c.1 as u32).collect(),
                         lists: st.lists,
                         dups: st.dups,
-                        clicks: st.clicks,
+                        crows: st.crows,
+                        cleft: st.ccur.iter().map(|c| c.1 as u32).collect(),
+                        clists: st.clists,
                     }
                 }));
             }
@@ -629,8 +639,13 @@ fn main() {
                                 }
                             }
                         }
-                        for c in &t.clicks[p] {
-                            unsafe { sub_cl.get_unchecked_mut(sub_of(c.user)).push(*c) };
+                        let l = &t.clists[p];
+                        for (bi, &b) in l.iter().enumerate() {
+                            let len = if bi + 1 == l.len() { BLK - t.cleft[p] as usize } else { BLK };
+                            let seg = unsafe { std::slice::from_raw_parts(t.crows.p().add(b as usize) as *const Click, len) };
+                            for c in seg {
+                                unsafe { sub_cl.get_unchecked_mut(sub_of(c.user)).push(*c) };
+                            }
                         }
                     }
                     for q in 0..nsub {
@@ -896,6 +911,7 @@ struct PersonState {
     cat_sum: Vec<i64>,
     cat_touched: Vec<u32>,
     name_buf: Vec<u8>,
+    name16: [u8; 16],
 }
 
 impl PersonState {
@@ -908,6 +924,7 @@ impl PersonState {
             cat_sum: vec![0; ncat],
             cat_touched: Vec::new(),
             name_buf: Vec::new(),
+            name16: [0; 16],
         }
     }
 
@@ -916,8 +933,20 @@ impl PersonState {
         if sessions == 0 {
             return;
         }
-        out.ids.extend_from_slice(&(self.name_buf.len() as u32).to_le_bytes());
-        out.ids.extend_from_slice(&self.name_buf);
+        let nl = self.name_buf.len();
+        if nl <= 12 {
+            // Length and bytes in one fixed 16-byte store.
+            out.ids.reserve(16);
+            unsafe {
+                let dst = out.ids.as_mut_ptr().add(out.ids.len());
+                (dst as *mut u32).write_unaligned(nl as u32);
+                std::ptr::copy_nonoverlapping(self.name16.as_ptr(), dst.add(4), 12);
+                out.ids.set_len(out.ids.len() + 4 + nl);
+            }
+        } else {
+            out.ids.extend_from_slice(&(nl as u32).to_le_bytes());
+            out.ids.extend_from_slice(&self.name_buf);
+        }
         out.day.push(day as i32);
         out.sessions.push(sessions);
         out.events.push(events);
@@ -952,6 +981,10 @@ impl PersonState {
     ) {
         self.name_buf.clear();
         unpack(name, &mut self.name_buf);
+        if self.name_buf.len() <= 12 {
+            self.name16 = [0; 16];
+            self.name16[..self.name_buf.len()].copy_from_slice(&self.name_buf);
+        }
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut cur_day = i64::MIN;
         let mut cur_di = usize::MAX;
@@ -1083,11 +1116,19 @@ unsafe fn parse_clicks(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, links: &
     const RING: usize = 16;
     let mut ring = [Click { user: 0, ckey: 0, ts: 0, camp: 0 }; RING];
     let mut n = 0usize;
-    let pshift = st.pshift;
-    let clicks = &mut st.clicks;
     let mut emit = |c: Click| {
         let name = links.get(c.user);
-        clicks.get_unchecked_mut((mix(name) >> pshift) as usize).push(Click { user: name, ..c });
+        let p = (mix(name) >> st.pshift) as usize;
+        let cur = st.ccur.get_unchecked_mut(p);
+        if cur.1 == 0 {
+            st.clists.get_unchecked_mut(p).push(st.cused as u32);
+            cur.0 = st.cused;
+            cur.1 = BLK;
+            st.cused += BLK;
+        }
+        st.crows.p().add(cur.0).write(Click { user: name, ..c });
+        cur.0 += 1;
+        cur.1 -= 1;
     };
     scan_lines(d, m.len, c.start, c.end, |ls, commas, nf, nl, qc| {
         let Some(f) = fields::<4>(d, ls, commas, nf, nl, qc) else { return };

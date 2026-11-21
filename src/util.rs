@@ -654,8 +654,12 @@ pub unsafe fn scan_lines<F: FnMut(usize, &[usize; 8], usize, usize, u32)>(
     let mut nf = 0usize;
     let mut qcarry = 0u32;
     b = line_start;
-    while b < flen {
-        let (c, q, n) = masks64(data.add(b));
+    // The end of the file acts as a final newline, so the handler has one call site.
+    while b <= flen {
+        let (c, q, mut n) = masks64(data.add(b));
+        if flen - b < 64 {
+            n |= 1u64 << (flen - b);
+        }
         let mut m = c | n;
         let mut qrem = q;
         while m != 0 {
@@ -681,9 +685,6 @@ pub unsafe fn scan_lines<F: FnMut(usize, &[usize; 8], usize, usize, u32)>(
         }
         qcarry += qrem.count_ones();
         b += 64;
-    }
-    if line_start < flen {
-        f(line_start, &commas, nf, flen, qcarry);
     }
 }
 
