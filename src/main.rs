@@ -539,6 +539,7 @@ fn main() {
                     let mut sbuf = ScanBuf::new();
                     let mut rbuf = ReadBuf::new();
                     let read_mode = use_read();
+                    let ring = use_ring();
                     let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, tag_mask, loc_base: (tid as u32) << lshift, _p: std::marker::PhantomData };
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
@@ -549,18 +550,18 @@ fn main() {
                             let c = &cl_chunks[j];
                             if read_mode {
                                 let (m, s, e) = unsafe { rbuf.fill(&cl_files[c.file], c.start, c.end) };
-                                unsafe { parse_clicks(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, links, &mut sbuf) };
+                                if ring { unsafe { parse_clicks_ring(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, links) } } else { unsafe { parse_clicks(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, links, &mut sbuf) } };
                             } else {
-                                unsafe { parse_clicks(ctx, &cl_files[c.file], c, &mut st, links, &mut sbuf) };
+                                if ring { unsafe { parse_clicks_ring(ctx, &cl_files[c.file], c, &mut st, links) } } else { unsafe { parse_clicks(ctx, &cl_files[c.file], c, &mut st, links, &mut sbuf) } };
                             }
                         } else {
                             let c = &ev_chunks[j - cl_chunks.len()];
                             let before = st.inserted;
                             if read_mode {
                                 let (m, s, e) = unsafe { rbuf.fill(&ev_files[c.file], c.start, c.end) };
-                                unsafe { parse_events(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, &tctx, links, &mut sbuf) };
+                                if ring { unsafe { parse_events_ring(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, &tctx, links) } } else { unsafe { parse_events(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, &tctx, links, &mut sbuf) } };
                             } else {
-                                unsafe { parse_events(ctx, &ev_files[c.file], c, &mut st, &tctx, links, &mut sbuf) };
+                                if ring { unsafe { parse_events_ring(ctx, &ev_files[c.file], c, &mut st, &tctx, links) } } else { unsafe { parse_events(ctx, &ev_files[c.file], c, &mut st, &tctx, links, &mut sbuf) } };
                             }
                             let n = st.inserted - before;
                             if inserted.fetch_add(n, Ordering::Relaxed) + n > limit {
@@ -1336,9 +1337,8 @@ struct Pending {
 /// Resolves the row's person, writes it to its partition and enters it in the dedup table.
 #[inline(always)]
 unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending) {
-    let stage = stage_limit();
     let (name, p) = if pe.w != DEAD_W {
-        let name = if stage == 5 || stage == 6 { pe.user } else { links.get(pe.user) };
+        let name = links.get(pe.user);
         (name, (h1(name) >> st.pshift) as usize)
     } else {
         (0, st.nparts)
@@ -1360,9 +1360,6 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
     // The next line of this partition's stream, so the store never waits on a miss.
     prefetch_w(st.rows.p().add(idx + 2));
     st.inserted += 1;
-    if stage == 4 || stage == 6 {
-        return;
-    }
     let loc = t.loc_base | idx as u32;
     let tag = pe.tag & t.tag_mask;
     let val = ((tag as u64) << 32) | (loc as u64 + 1);
@@ -1506,4 +1503,137 @@ unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &Tabl
 fn stage_limit() -> u8 {
     static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("STAGE").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(3))
+}
+
+#[inline(never)]
+unsafe fn parse_clicks_ring(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, links: &LinkTable) {
+    let d = m.ptr;
+    let mut dc = DateCache::new();
+    let lo = ctx.ws - WEEK_MS;
+    const RING: usize = 16;
+    let mut ring = [Click { user: 0, ckey: 0, ts: 0, camp: 0 }; RING];
+    let mut n = 0usize;
+    let mut emit = |c: Click| {
+        let name = links.get(c.user);
+        let p = (h1(name) >> st.pshift) as usize;
+        let cur = st.ccur.get_unchecked_mut(p);
+        if cur.1 == 0 {
+            if st.cused % POP == 0 {
+                populate(st.crows.p().add(st.cused), POP.min(st.click_cap - st.cused));
+            }
+            st.clists.get_unchecked_mut(p).push(st.cused as u32);
+            cur.0 = st.cused;
+            cur.1 = BLK;
+            st.cused += BLK;
+        }
+        st.crows.p().add(cur.0).write(Click { user: name, ..c });
+        cur.0 += 1;
+        cur.1 -= 1;
+    };
+    scan_lines(d, m.len, c.start, c.end, |ls, commas, nf, nl, qc| {
+        let Some(f) = fields::<4>(d, ls, commas, nf, nl, qc) else { return };
+        if f[0].1 == 0 || f[1].1 == 0 || f[2].1 == 0 {
+            return;
+        }
+        let ts = parse_ts(d.add(f[3].0), f[3].1, &mut dc);
+        if ts < lo || ts >= ctx.we {
+            return;
+        }
+        let Some(camp) = ctx.campaigns.get(pack(d.add(f[2].0), f[2].1)) else { return };
+        let user = pack(d.add(f[1].0), f[1].1);
+        links.prefetch(user);
+        let r = n % RING;
+        if n >= RING {
+            emit(ring[r]);
+        }
+        ring[r] = Click { user, ckey: pack(d.add(f[0].0), f[0].1), ts: (ts - lo) as u32, camp };
+        n += 1;
+    });
+    for i in 0..n.min(RING) {
+        emit(ring[i]);
+    }
+}
+
+#[inline(never)]
+unsafe fn parse_events_ring(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &TableCtx, links: &LinkTable) {
+    let d = m.ptr;
+    let mut dc = DateCache::new();
+    let mut n = 0usize;
+    let ring_n = ring_size();
+    let mut ring = [Pending { key: 0, user: 0, w: 0, slot: 0, tag: 0, ingest: 0 }; 64];
+    let (ws, we) = (ctx.ws, ctx.we);
+    scan_lines(d, m.len, c.start, c.end, |ls, commas, nf, nl, qc| {
+        let Some(f) = fields::<7>(d, ls, commas, nf, nl, qc) else { return };
+        if f[0].1 == 0 {
+            return;
+        }
+        let key = pack(d.add(f[0].0), f[0].1);
+        let ing = parse_f1(d.add(f[3].0), f[3].1, &mut dc);
+        let h = h1(key);
+        let mut pe = Pending { key, user: 0, w: DEAD_W, slot: (h >> t.tshift) as usize, tag: (h >> 7) as u32, ingest: u32::MAX };
+        prefetch_w(t.table.p().add(pe.slot));
+        if ing != INVALID {
+            pe.ingest = ing.clamp(0, (u32::MAX - 1) as i64) as u32;
+        }
+        'v: {
+            if ing == INVALID || f[1].1 == 0 || f[5].1 == 0 {
+                break 'v;
+            }
+            let ts = parse_ts(d.add(f[2].0), f[2].1, &mut dc);
+            if ts < ws || ts >= we || ing * 1000 - ts > DAY_MS {
+                break 'v;
+            }
+            let tp = d.add(f[4].0);
+            let mut extra = 0u32;
+            match f[4].1 {
+                4 => {
+                    let x = (tp as *const u32).read_unaligned();
+                    if x != u32::from_ne_bytes(*b"view") && x != u32::from_ne_bytes(*b"cart") {
+                        break 'v;
+                    }
+                }
+                8 => {
+                    if (tp as *const u64).read_unaligned() != u64::from_ne_bytes(*b"purchase") {
+                        break 'v;
+                    }
+                    let price = parse_price(d.add(f[6].0), f[6].1);
+                    if price == 0 {
+                        break 'v;
+                    }
+                    let cat = ctx.products.get(pack(d.add(f[5].0), f[5].1)).unwrap_or(ctx.cat_unknown);
+                    extra = price | (cat << 24);
+                }
+                _ => break 'v,
+            }
+            pe.user = pack(d.add(f[1].0), f[1].1);
+            links.prefetch(pe.user);
+            pe.w = (((ts - ws) as u64) << 32) | extra as u64;
+        }
+        let r = n & (ring_n - 1);
+        if n >= ring_n {
+            commit(st, t, links, ring[r]);
+        }
+        ring[r] = pe;
+        n += 1;
+    });
+    for i in 0..n.min(ring_n) {
+        commit(st, t, links, ring[i]);
+    }
+}
+
+/// Which line scanner parses events and clicks: the batched two-stage one, or the
+/// simpler one that handles each line as its separators are found. SCAN=batch / SCAN=ring.
+const DEFAULT_RING: bool = true;
+fn use_ring() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("SCAN") {
+        Ok(v) => v == "ring",
+        Err(_) => DEFAULT_RING,
+    })
+}
+
+/// How many lines ahead the table and link slots are prefetched (ring scanner).
+fn ring_size() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("RING").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| n.is_power_of_two() && *n <= 64).unwrap_or(16))
 }
