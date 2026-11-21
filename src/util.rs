@@ -855,15 +855,30 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
                 }
             }
             ni += cnt;
+            // Up to two newlines without a data-dependent branch (a third needs lines
+            // under 32 bytes); the loop only runs for the rest.
+            let ncnt = n.count_ones() as usize;
             let mut nm = n;
-            while nm != 0 {
+            for k in 0..2 {
                 let i = nm.trailing_zeros();
-                *buf.nlp.as_mut_ptr().add(nn) = off + i;
-                *buf.qcum.as_mut_ptr().add(nn) = qrun + (q & ((1u64 << i) - 1)).count_ones();
-                nn += 1;
-                nm &= nm - 1;
-                last_nl_end = b + i as usize + 1;
+                *buf.nlp.as_mut_ptr().add(nn + k) = off + i;
+                *buf.qcum.as_mut_ptr().add(nn + k) = qrun + (q & (1u64 << (i & 63)).wrapping_sub(1)).count_ones();
+                nm &= nm.wrapping_sub(1);
             }
+            if ncnt > 2 {
+                let mut k = 2;
+                while nm != 0 {
+                    let i = nm.trailing_zeros();
+                    *buf.nlp.as_mut_ptr().add(nn + k) = off + i;
+                    *buf.qcum.as_mut_ptr().add(nn + k) = qrun + (q & ((1u64 << i) - 1)).count_ones();
+                    nm &= nm - 1;
+                    k += 1;
+                }
+            }
+            nn += ncnt;
+            // Highest newline of the block, if any.
+            let top = 63 - (n | 1).leading_zeros() as usize;
+            last_nl_end = if n != 0 { b + top + 1 } else { last_nl_end };
             qrun += q.count_ones();
             b += 64;
             // Lines that start at or after `end` belong to the next chunk.
