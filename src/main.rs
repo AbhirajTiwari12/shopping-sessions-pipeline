@@ -29,6 +29,8 @@ struct Chunk {
 
 /// Rows are written in blocks of BLK per partition.
 const BLK: usize = 512;
+/// Rows faulted in per kernel call.
+const POP: usize = 1 << 16;
 const DEAD_W: u64 = u64::MAX;
 
 /// One event: the person and the packed time and purchase, then what dedup needs.
@@ -54,6 +56,8 @@ struct EvState {
     clists: Vec<Vec<u32>>,
     nparts: usize,
     pshift: u32,
+    row_cap: usize,
+    click_cap: usize,
 }
 
 struct ThreadOut {
@@ -175,12 +179,19 @@ impl LinkTable {
         let cap = (lines.load(Ordering::Relaxed) * 4).max(1024).next_power_of_two();
         let t = LinkTable { e: P(alloc_zeroed::<[AtomicU64; 2]>(cap)), mask: cap - 1, shift: 64 - cap.trailing_zeros() };
         let next = AtomicUsize::new(0);
+        let tids = AtomicUsize::new(0);
         std::thread::scope(|sc| {
             for _ in 0..nthreads {
                 sc.spawn(|| loop {
                     let j = next.fetch_add(1, Ordering::Relaxed);
                     if j >= chunks.len() {
                         break;
+                    }
+                    if j < nthreads {
+                        let k = tids.fetch_add(1, Ordering::Relaxed);
+                        if k < nthreads {
+                            populate(unsafe { t.e.p().add(cap / nthreads * k) }, cap / nthreads);
+                        }
                     }
                     let c = &chunks[j];
                     let m = &files[c.file];
@@ -473,7 +484,10 @@ fn main() {
                         clists: (0..nparts).map(|_| Vec::new()).collect(),
                         nparts,
                         pshift,
+                        row_cap,
+                        click_cap: cl_bytes / 8 + 16 + (nparts + 1) * BLK,
                     };
+                    populate(unsafe { table.p().add(slots / nthreads * tid) }, slots / nthreads);
                     let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, tag_mask, loc_base: (tid as u32) << lshift, _p: std::marker::PhantomData };
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
@@ -1121,6 +1135,9 @@ unsafe fn parse_clicks(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, links: &
         let p = (mix(name) >> st.pshift) as usize;
         let cur = st.ccur.get_unchecked_mut(p);
         if cur.1 == 0 {
+            if st.cused % POP == 0 {
+                populate(st.crows.p().add(st.cused), POP.min(st.click_cap - st.cused));
+            }
             st.clists.get_unchecked_mut(p).push(st.cused as u32);
             cur.0 = st.cused;
             cur.1 = BLK;
@@ -1175,6 +1192,9 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
     };
     let c = st.cur.get_unchecked_mut(p);
     if c.1 == 0 {
+        if st.used % POP == 0 {
+            populate(st.rows.p().add(st.used), POP.min(st.row_cap - st.used));
+        }
         st.lists.get_unchecked_mut(p).push(st.used as u32);
         c.0 = st.used;
         c.1 = BLK;

@@ -70,6 +70,24 @@ pub fn alloc_zeroed_opt<T>(n: usize, huge: bool) -> *mut T {
         p as *mut T
     }
 }
+/// Fault in a range of anonymous memory in one kernel call instead of page by page.
+#[inline]
+pub fn populate<T>(p: *mut T, n: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        const MADV_POPULATE_WRITE: i32 = 23;
+        let start = (p as usize) & !0xFFF;
+        let end = (p as usize + n * std::mem::size_of::<T>() + 0xFFF) & !0xFFF;
+        if end > start && !no_populate() {
+            libc::madvise(start as *mut libc::c_void, end - start, MADV_POPULATE_WRITE);
+        }
+    }
+    let _ = (p, n);
+}
+pub fn no_populate() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NO_POPULATE").is_ok())
+}
 pub fn no_huge() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NO_HUGE").is_ok())
