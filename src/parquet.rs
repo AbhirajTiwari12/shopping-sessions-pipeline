@@ -7,6 +7,9 @@ pub enum Col<'a> {
     Str { name: &'a str, data: &'a [u8] },
     I32 { name: &'a str, data: &'a [i32], date: bool },
     I64 { name: &'a str, data: &'a [i64] },
+    /// Required INT32 column written dictionary-encoded with bit-packed indexes when it
+    /// has few distinct values (plain otherwise).
+    SmallI32 { name: &'a str, data: &'a [i32], date: bool },
     /// Nullable dictionary-encoded string; index >= dict.len() is null.
     DictStr { name: &'a str, dict: &'a [Vec<u8>], idx: &'a [u8] },
 }
@@ -131,6 +134,31 @@ pub fn write_file(path: &std::path::Path, nrows: usize, cols: &[Col]) {
                     put(&mut f, bytes, &mut pos);
                     metas.push(Meta { ty: 1, encodings: vec![0, 3], start, dict_off: None, data_off: start, size: pos - start });
                 }
+                Col::SmallI32 { data, .. } => {
+                    match small_dict(data) {
+                        Some((dict, bw, packed)) => {
+                            let d = unsafe { std::slice::from_raw_parts(dict.as_ptr() as *const u8, dict.len() * 4) };
+                            put(&mut f, &page_header(2, d.len(), dict.len(), 0), &mut pos);
+                            put(&mut f, d, &mut pos);
+                            let data_off = pos;
+                            let groups = (nrows + 7) / 8;
+                            let mut head = Thrift::new();
+                            head.b.push(bw as u8);
+                            head.varint(((groups as u64) << 1) | 1);
+                            let body_len = head.b.len() + groups * bw;
+                            put(&mut f, &page_header(0, body_len, nrows, 8), &mut pos);
+                            put(&mut f, &head.b, &mut pos);
+                            put(&mut f, &packed[..groups * bw], &mut pos);
+                            metas.push(Meta { ty: 1, encodings: vec![0, 3, 8], start, dict_off: Some(start), data_off, size: pos - start });
+                        }
+                        None => {
+                            let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+                            put(&mut f, &page_header(0, bytes.len(), nrows, 0), &mut pos);
+                            put(&mut f, bytes, &mut pos);
+                            metas.push(Meta { ty: 1, encodings: vec![0, 3], start, dict_off: None, data_off: start, size: pos - start });
+                        }
+                    }
+                }
                 Col::I64 { data, .. } => {
                     let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
                     put(&mut f, &page_header(0, bytes.len(), nrows, 0), &mut pos);
@@ -208,6 +236,13 @@ pub fn write_file(path: &std::path::Path, nrows: usize, cols: &[Col]) {
                     (1, 0, name, None, None)
                 }
             }
+            Col::SmallI32 { name, date, .. } => {
+                if *date {
+                    (1, 0, name, Some(6), Some(6))
+                } else {
+                    (1, 0, name, None, None)
+                }
+            }
             Col::I64 { name, .. } => (2, 0, name, None, None),
             Col::DictStr { name, .. } => (6, 1, name, Some(0), Some(1)),
         };
@@ -233,7 +268,7 @@ pub fn write_file(path: &std::path::Path, nrows: usize, cols: &[Col]) {
         let mut total = 0usize;
         for (c, m) in cols.iter().zip(&metas) {
             let name = match c {
-                Col::Str { name, .. } | Col::I32 { name, .. } | Col::I64 { name, .. } | Col::DictStr { name, .. } => name,
+                Col::Str { name, .. } | Col::I32 { name, .. } | Col::SmallI32 { name, .. } | Col::I64 { name, .. } | Col::DictStr { name, .. } => name,
             };
             t.push_struct();
             t.i64(2, m.start as i64);
@@ -270,4 +305,46 @@ pub fn write_file(path: &std::path::Path, nrows: usize, cols: &[Col]) {
     t.b.extend_from_slice(&n.to_le_bytes());
     t.b.extend_from_slice(b"PAR1");
     put(&mut f, &t.b, &mut pos);
+}
+
+/// Dictionary and bit-packed indexes for a column with at most 4096 distinct values
+/// (in a range of at most 2^20); None when it has more.
+fn small_dict(data: &[i32]) -> Option<(Vec<i32>, usize, Vec<u8>)> {
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for &v in data {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    if data.is_empty() || (hi as i64 - lo as i64) >= (1 << 20) {
+        return None;
+    }
+    // Value to dictionary index, by offset from the minimum.
+    let mut index = vec![u16::MAX; (hi - lo) as usize + 1];
+    let mut dict: Vec<i32> = Vec::new();
+    for &v in data {
+        let slot = &mut index[(v - lo) as usize];
+        if *slot == u16::MAX {
+            if dict.len() == 4096 {
+                return None;
+            }
+            *slot = dict.len() as u16;
+            dict.push(v);
+        }
+    }
+    let bw = (usize::BITS - (dict.len().max(2) - 1).leading_zeros()) as usize;
+    let groups = (data.len() + 7) / 8;
+    let mut packed = vec![0u8; groups * bw + 16];
+    let (mut acc, mut nbits, mut at) = (0u64, 0usize, 0usize);
+    for &v in data {
+        acc |= (index[(v - lo) as usize] as u64) << nbits;
+        nbits += bw;
+        if nbits >= 32 {
+            packed[at..at + 4].copy_from_slice(&(acc as u32).to_le_bytes());
+            at += 4;
+            acc >>= 32;
+            nbits -= 32;
+        }
+    }
+    packed[at..at + 8].copy_from_slice(&acc.to_le_bytes());
+    Some((dict, bw, packed))
 }

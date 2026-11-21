@@ -839,14 +839,15 @@ fn main() {
 }
 
 fn write_user_file(out_dir: &Path, tid: usize, out: &UserOut, cats: &[Vec<u8>]) {
+    let small = small_output();
     parquet::write_file(
         &out_dir.join("user_daily").join(format!("part-{tid}.parquet")),
         out.day.len(),
         &[
             Col::Str { name: "user_id", data: &out.ids },
-            Col::I32 { name: "day", data: &out.day, date: true },
-            Col::I32 { name: "sessions", data: &out.sessions, date: false },
-            Col::I32 { name: "events", data: &out.events, date: false },
+            if small { Col::SmallI32 { name: "day", data: &out.day, date: true } } else { Col::I32 { name: "day", data: &out.day, date: true } },
+            if small { Col::SmallI32 { name: "sessions", data: &out.sessions, date: false } } else { Col::I32 { name: "sessions", data: &out.sessions, date: false } },
+            if small { Col::SmallI32 { name: "events", data: &out.events, date: false } } else { Col::I32 { name: "events", data: &out.events, date: false } },
             Col::I64 { name: "revenue_cents", data: &out.revenue },
             Col::DictStr { name: "top_category", dict: cats, idx: &out.cat },
         ],
@@ -1660,4 +1661,12 @@ fn use_ring() -> bool {
 fn ring_size() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("RING").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| n.is_power_of_two() && *n <= 64).unwrap_or(16))
+}
+
+/// Whether the small integer columns of user_daily are dictionary-encoded and
+/// bit-packed. SMALL_OUT=1 / SMALL_OUT=0 override it.
+const DEFAULT_SMALL_OUT: bool = false;
+fn small_output() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SMALL_OUT").map_or(DEFAULT_SMALL_OUT, |v| v != "0"))
 }
