@@ -1378,6 +1378,8 @@ struct EvSink<'a> {
     dc: DateCache,
     pend: [Pending; PEND],
     np: usize,
+    /// Timing experiments only: 1 stops after scanning, 2 after decoding.
+    stage: u8,
 }
 
 impl LineSink for EvSink<'_> {
@@ -1385,6 +1387,9 @@ impl LineSink for EvSink<'_> {
     unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32) {
         let d = self.d;
         let _ = (ls, nl);
+        if self.stage == 1 {
+            return;
+        }
         // A quote is syntax only around a whole field: the line is well formed when
         // its quotes are exactly those of its wrapped fields.
         let (mut st, mut ln) = ([0u32; 8], [0u32; 8]);
@@ -1454,6 +1459,10 @@ impl LineSink for EvSink<'_> {
     }
     #[inline(always)]
     unsafe fn flush(&mut self) {
+        if self.stage == 2 {
+            self.np = 0;
+            return;
+        }
         for i in 0..self.np {
             commit(self.st, self.t, self.links, *self.pend.get_unchecked(i));
         }
@@ -1472,6 +1481,12 @@ unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &Tabl
         dc: DateCache::new(),
         pend: [Pending { key: 0, user: 0, w: 0, slot: 0, tag: 0, ingest: 0 }; PEND],
         np: 0,
+        stage: stage_limit(),
     };
     scan_batches::<_, 7>(m.ptr, m.len, c.start, c.end, buf, &mut sink);
+}
+
+fn stage_limit() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("STAGE").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(3))
 }
