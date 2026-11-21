@@ -180,10 +180,16 @@ pub unsafe fn pack(p: *const u8, len: usize) -> u64 {
         let t = a | !m;
         let zero = t.wrapping_sub(0x0101_0101_0101_0101) & !t & 0x8080_8080_8080_8080;
         if (a & 0x8080_8080_8080_8080) | zero | (b & 0x80) == 0 && (len < 9 || b != 0) {
-            let mut x = a.swap_bytes();
-            x = ((x & 0x7F00_7F00_7F00_7F00) >> 1) | (x & 0x007F_007F_007F_007F);
-            x = ((x & 0x3FFF_0000_3FFF_0000) >> 2) | (x & 0x0000_3FFF_0000_3FFF);
-            x = ((x & 0x0FFF_FFFF_0000_0000) >> 4) | (x & 0x0000_0000_0FFF_FFFF);
+            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+            let x = std::arch::x86_64::_pext_u64(a.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F);
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            let x = {
+                let mut x = a.swap_bytes();
+                x = ((x & 0x7F00_7F00_7F00_7F00) >> 1) | (x & 0x007F_007F_007F_007F);
+                x = ((x & 0x3FFF_0000_3FFF_0000) >> 2) | (x & 0x0000_3FFF_0000_3FFF);
+                x = ((x & 0x0FFF_FFFF_0000_0000) >> 4) | (x & 0x0000_0000_0FFF_FFFF);
+                x
+            };
             return (x << 7) | b;
         }
     }

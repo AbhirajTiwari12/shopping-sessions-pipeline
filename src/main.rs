@@ -311,6 +311,62 @@ fn read_lookup(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
+/// Products with their categories, and campaigns with their channels.
+/// Category ids follow byte order, so a tie goes to the smaller id.
+fn load_lookups(data_dir: &Path, ws: i64, we: i64) -> (Ctx, Vec<Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>) {
+    let pm = map_file(&data_dir.join("products.csv"));
+    let mut seen: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+    let mut names: Vec<&[u8]> = Vec::new();
+    let mut rows: Vec<(u64, u32)> = Vec::with_capacity(pm.len / 12 + 16);
+    let mut last: (&[u8], u32) = (&[], u32::MAX);
+    unsafe {
+        scan_lines(pm.ptr, pm.len, 0, pm.len, |ls, commas, nf, nl, qc| {
+            let Some(f) = fields::<2>(pm.ptr, ls, commas, nf, nl, qc) else { return };
+            if f[0].1 == 0 {
+                return;
+            }
+            let cat: &[u8] = std::slice::from_raw_parts(pm.ptr.add(f[1].0), f[1].1);
+            let id = if last.1 != u32::MAX && last.0 == cat {
+                last.1
+            } else {
+                let n = names.len() as u32;
+                let id = *seen.entry(cat).or_insert(n);
+                if id == n {
+                    names.push(cat);
+                }
+                id
+            };
+            last = (cat, id);
+            rows.push((pack(pm.ptr.add(f[0].0), f[0].1), id));
+        });
+    }
+    let mut cats: Vec<Vec<u8>> = names.iter().map(|n| n.to_vec()).collect();
+    cats.push(b"unknown".to_vec());
+    cats.sort();
+    cats.dedup();
+    assert!(cats.len() <= 255, "too many categories for this build");
+    let cat_unknown = cats.binary_search(&b"unknown".to_vec()).unwrap() as u32;
+    let remap: Vec<u32> = names.iter().map(|n| cats.binary_search(&n.to_vec()).unwrap() as u32).collect();
+    let mut products: KMap<u32> = KMap::with_capacity(rows.len());
+    for &(k, id) in &rows {
+        products.get_or_insert(k, remap[id as usize]);
+    }
+    let camp_rows = read_lookup(&data_dir.join("campaigns.csv"));
+    let mut campaigns: KMap<u32> = KMap::with_capacity(camp_rows.len());
+    let mut camp_names: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (id, ch) in &camp_rows {
+        if !id.is_empty() {
+            let k = pack_slice(id);
+            if campaigns.get(k).is_none() {
+                campaigns.get_or_insert(k, camp_names.len() as u32);
+                camp_names.push((id.clone(), ch.clone()));
+            }
+        }
+    }
+    camp_names.push((b"organic".to_vec(), b"organic".to_vec()));
+    (Ctx { ws, we, products, cat_unknown, campaigns }, cats, camp_names)
+}
+
 #[derive(Default)]
 struct UserOut {
     ids: Vec<u8>,
@@ -344,35 +400,11 @@ fn main() {
     let day0 = ws.div_euclid(DAY_MS);
     let ndays = (((we - 1).div_euclid(DAY_MS) - day0 + 1).max(1)) as usize;
 
-    // Products and categories. Category ids follow byte order, so a tie goes to the smaller id.
-    let prod_rows = read_lookup(&data_dir.join("products.csv"));
-    let mut cats: Vec<Vec<u8>> = prod_rows.iter().map(|r| r.1.clone()).collect();
-    cats.push(b"unknown".to_vec());
-    cats.sort();
-    cats.dedup();
-    assert!(cats.len() <= 255, "too many categories for this build");
-    let cat_unknown = cats.binary_search(&b"unknown".to_vec()).unwrap() as u32;
-    let mut products: KMap<u32> = KMap::with_capacity(prod_rows.len());
-    for (id, cat) in &prod_rows {
-        if !id.is_empty() {
-            products.get_or_insert(pack_slice(id), cats.binary_search(cat).unwrap() as u32);
-        }
-    }
-    let camp_rows = read_lookup(&data_dir.join("campaigns.csv"));
-    let mut campaigns: KMap<u32> = KMap::with_capacity(camp_rows.len());
-    let mut camp_names: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for (id, ch) in &camp_rows {
-        if !id.is_empty() {
-            let k = pack_slice(id);
-            if campaigns.get(k).is_none() {
-                campaigns.get_or_insert(k, camp_names.len() as u32);
-                camp_names.push((id.clone(), ch.clone()));
-            }
-        }
-    }
-    let ncamp = camp_names.len();
-    camp_names.push((b"organic".to_vec(), b"organic".to_vec()));
-    let ctx = Ctx { ws, we, products, cat_unknown, campaigns };
+    // Products and campaigns load on their own thread while the links are joined.
+    let lookups = {
+        let dir = data_dir.clone();
+        std::thread::spawn(move || load_lookups(&dir, ws, we))
+    };
 
     // Map inputs and cut them into chunks.
     let ev_files: Vec<Map> = list_csv(&data_dir.join("events")).iter().map(|p| map_file(p)).collect();
@@ -411,6 +443,10 @@ fn main() {
     // Phase 1: links. Every ID in a link maps to its person's name.
     let links = LinkTable::build(&ln_files, &ln_chunks, nthreads);
     lap("links");
+
+    let (ctx, cats, camp_names) = lookups.join().unwrap();
+    let ncamp = camp_names.len() - 1;
+    lap("lookups");
 
     // Dedup table size: from the sampled line length, never more than the guaranteed
     // bound (a valid event line has at least 28 bytes).
