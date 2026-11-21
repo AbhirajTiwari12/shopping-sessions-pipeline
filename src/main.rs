@@ -480,7 +480,8 @@ fn main() {
     let pbits = ((est_rows >> 16).max(1).next_power_of_two().trailing_zeros()).clamp(2, 7);
     let nparts = 1usize << pbits;
     let pshift = 64 - pbits;
-    let sbits = (((est_rows >> pbits) / 6000).max(1).next_power_of_two().trailing_zeros()).min(10);
+    let sub_rows = std::env::var("SUB_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(6000);
+    let sbits = (((est_rows >> pbits) / sub_rows).max(1).next_power_of_two().trailing_zeros()).min(10);
     let nsub = 1usize << sbits;
     if verbose {
         eprintln!("est {est} bound {rec_bound} tbits {tbits} g_bits {g_bits} nparts {nparts}");
