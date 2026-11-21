@@ -544,16 +544,10 @@ fn main() {
                 let mut agg = vec![[0i64; 4]; (ncamp + 1) * ndays];
                 let mut out = UserOut::default();
                 let mut st = PersonState::new(ncamp, cats.len());
-                let mut lm = LocalMap::new();
+                let mut sc = Scratch::default();
+                let env = Env { ws, day0, ndays, ncamp };
                 let mut sub_ev: Vec<Vec<[u64; 2]>> = (0..nsub).map(|_| Vec::new()).collect();
                 let mut sub_cl: Vec<Vec<Click>> = (0..nsub).map(|_| Vec::new()).collect();
-                let mut names: Vec<u64> = Vec::new();
-                let mut off: Vec<u32> = Vec::new();
-                let mut coff: Vec<u32> = Vec::new();
-                let mut ids: Vec<u32> = Vec::new();
-                let mut cids: Vec<u32> = Vec::new();
-                let mut ev: Vec<u64> = Vec::new();
-                let mut cl: Vec<Click> = Vec::new();
                 loop {
                     let p = next.fetch_add(1, Ordering::Relaxed);
                     if p >= nparts {
@@ -583,77 +577,7 @@ fn main() {
                         }
                     }
                     for q in 0..nsub {
-                        let rows = &sub_ev[q];
-                        let n = rows.len();
-                        if n == 0 {
-                            continue;
-                        }
-                        // Dense person numbers, then a counting sort by person.
-                        lm.reset(n / 4);
-                        names.clear();
-                        off.clear();
-                        ids.clear();
-                        for r in rows.iter() {
-                            let id = lm.get_or_insert(r[0], &mut names);
-                            if id as usize == off.len() {
-                                off.push(0);
-                            }
-                            off[id as usize] += 1;
-                            ids.push(id);
-                        }
-                        let np = names.len();
-                        let mut acc = 0u32;
-                        for o in off.iter_mut() {
-                            let c = *o;
-                            *o = acc;
-                            acc += c;
-                        }
-                        off.push(acc);
-                        ev.clear();
-                        ev.resize(n, 0);
-                        for (r, &id) in rows.iter().zip(ids.iter()) {
-                            let id = id as usize;
-                            ev[off[id] as usize] = r[1];
-                            off[id] += 1;
-                        }
-                        // off[id] is now the end of person id, which is the start of id + 1.
-                        coff.clear();
-                        coff.resize(np + 1, 0);
-                        cids.clear();
-                        for c in sub_cl[q].iter() {
-                            let id = lm.get(c.user);
-                            cids.push(id);
-                            if id != u32::MAX {
-                                coff[id as usize] += 1;
-                            }
-                        }
-                        let mut acc = 0u32;
-                        for o in coff.iter_mut() {
-                            let c = *o;
-                            *o = acc;
-                            acc += c;
-                        }
-                        cl.clear();
-                        cl.resize(acc as usize, Click { user: 0, ckey: 0, ts: 0, camp: 0 });
-                        for (c, &id) in sub_cl[q].iter().zip(cids.iter()) {
-                            if id != u32::MAX {
-                                cl[coff[id as usize] as usize] = *c;
-                                coff[id as usize] += 1;
-                            }
-                        }
-                        let (mut es, mut cs) = (0usize, 0usize);
-                        for id in 0..np {
-                            let (ee, ce) = (off[id] as usize, coff[id] as usize);
-                            let e = &mut ev[es..ee];
-                            e.sort_unstable();
-                            let c = &mut cl[cs..ce];
-                            if c.len() > 1 {
-                                c.sort_unstable_by_key(|c| (c.ts, c.ckey));
-                            }
-                            st.person(names[id], e, c, ws, day0, ndays, ncamp, &mut agg, &mut out);
-                            es = ee;
-                            cs = ce;
-                        }
+                        process_sub(&mut sc, &sub_ev[q], &sub_cl[q], &mut st, &env, &mut agg, &mut out);
                     }
                 }
                 let n = out.day.len();
@@ -736,7 +660,108 @@ fn write_user_file(out_dir: &Path, tid: usize, out: &UserOut, cats: &[Vec<u8>]) 
     );
 }
 
+struct Env {
+    ws: i64,
+    day0: i64,
+    ndays: usize,
+    ncamp: usize,
+}
+
+#[derive(Default)]
+struct Scratch {
+    lm: LocalMap,
+    names: Vec<u64>,
+    off: Vec<u32>,
+    coff: Vec<u32>,
+    ids: Vec<u32>,
+    cids: Vec<u32>,
+    ev: Vec<u64>,
+    cl: Vec<Click>,
+}
+
+/// One sub-partition: group rows by person, sort each person by time, sessionize.
+#[inline(never)]
+fn process_sub(sc: &mut Scratch, rows: &[[u64; 2]], clicks: &[Click], st: &mut PersonState, env: &Env, agg: &mut [[i64; 4]], out: &mut UserOut) {
+    let Scratch { lm, names, off, coff, ids, cids, ev, cl } = sc;
+    let n = rows.len();
+    if n == 0 {
+        return;
+    }
+    // Dense person numbers, then a counting sort by person.
+    lm.reset(n / 4);
+    names.clear();
+    off.clear();
+    ids.clear();
+    for r in rows.iter() {
+        let id = lm.get_or_insert(r[0], names);
+        if id as usize == off.len() {
+            off.push(0);
+        }
+        off[id as usize] += 1;
+        ids.push(id);
+    }
+    let np = names.len();
+    let mut acc = 0u32;
+    for o in off.iter_mut() {
+        let c = *o;
+        *o = acc;
+        acc += c;
+    }
+    off.push(acc);
+    ev.clear();
+    ev.resize(n, 0);
+    for (r, &id) in rows.iter().zip(ids.iter()) {
+        let id = id as usize;
+        ev[off[id] as usize] = r[1];
+        off[id] += 1;
+    }
+    // off[id] is now the end of person id, which is the start of id + 1.
+    coff.clear();
+    coff.resize(np + 1, 0);
+    cids.clear();
+    for c in clicks.iter() {
+        let id = lm.get(c.user);
+        cids.push(id);
+        if id != u32::MAX {
+            coff[id as usize] += 1;
+        }
+    }
+    let mut acc = 0u32;
+    for o in coff.iter_mut() {
+        let c = *o;
+        *o = acc;
+        acc += c;
+    }
+    cl.clear();
+    cl.resize(acc as usize, Click { user: 0, ckey: 0, ts: 0, camp: 0 });
+    for (c, &id) in clicks.iter().zip(cids.iter()) {
+        if id != u32::MAX {
+            cl[coff[id as usize] as usize] = *c;
+            coff[id as usize] += 1;
+        }
+    }
+    let (mut es, mut cs) = (0usize, 0usize);
+    for id in 0..np {
+        let (ee, ce) = (off[id] as usize, coff[id] as usize);
+        let e = &mut ev[es..ee];
+        sort_times(e);
+        let c = &mut cl[cs..ce];
+        if c.len() > 1 {
+            c.sort_unstable_by_key(|c| (c.ts, c.ckey));
+        }
+        st.person(names[id], e, c, env.ws, env.day0, env.ndays, env.ncamp, agg, out);
+        es = ee;
+        cs = ce;
+    }
+}
+
+#[inline(never)]
+fn sort_times(e: &mut [u64]) {
+    e.sort_unstable();
+}
+
 /// Person name to dense number within one partition.
+#[derive(Default)]
 struct LocalMap {
     keys: Vec<u64>,
     ids: Vec<u32>,
@@ -850,6 +875,7 @@ impl PersonState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn person(
         &mut self,
         name: u64,

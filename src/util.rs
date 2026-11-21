@@ -457,21 +457,43 @@ unsafe fn parse_f2(p: *const u8, dc: &mut DateCache) -> i64 {
 }
 
 #[inline(always)]
+fn parse8(v: u64) -> u64 {
+    // Eight digit values, most significant in the lowest byte.
+    let v = (v.wrapping_mul(2561)) >> 8;
+    let v = ((v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601)) >> 16;
+    ((v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001)) >> 32
+}
+
+#[inline(always)]
 unsafe fn parse_f3(p: *const u8, len: usize) -> i64 {
+    if len.wrapping_sub(1) < 16 {
+        // Up to 16 digits: right-align them in 16 bytes, padded with zeros on the left.
+        const ZEROS: u128 = 0x3030_3030_3030_3030_3030_3030_3030_3030;
+        let x = u128::from_le((p as *const u128).read_unaligned());
+        let sh = 8 * (16 - len as u32);
+        let x = (x << sh) | (ZEROS & ((1u128 << sh) - 1));
+        let t = x ^ ZEROS;
+        if (t | t.wrapping_add(0x0606_0606_0606_0606_0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0 != 0 {
+            return INVALID;
+        }
+        return (parse8(t as u64) * 100_000_000 + parse8((t >> 64) as u64)) as i64;
+    }
+    parse_f3_slow(p, len)
+}
+
+#[inline(never)]
+unsafe fn parse_f3_slow(p: *const u8, len: usize) -> i64 {
     if len == 0 {
         return INVALID;
     }
     let mut v: i64 = 0;
     let mut i = 0;
-    if len > 18 {
-        // Leading zeros are fine; more than 18 significant digits is outside any window.
-        while i < len && *p.add(i) == b'0' {
-            i += 1;
-        }
-        if len - i > 18 {
-            // Still must be all digits to be a number at all, but either way it is bad.
-            return INVALID;
-        }
+    // Leading zeros are fine; more than 18 significant digits is outside any window.
+    while i < len && *p.add(i) == b'0' {
+        i += 1;
+    }
+    if len - i > 18 {
+        return INVALID;
     }
     while i < len {
         let d = (*p.add(i)).wrapping_sub(b'0');
@@ -685,18 +707,16 @@ pub unsafe fn fields<const N: usize>(
         out[i] = (s, e - s);
         s = e + 1;
     }
-    if qc != 0 {
-        let mut w = 0;
-        for i in 0..N {
-            let (s, l) = out[i];
-            if l >= 2 && *d.add(s) == b'"' && *d.add(s + l - 1) == b'"' {
-                out[i] = (s + 1, l - 2);
-                w += 1;
-            }
-        }
-        if qc != 2 * w {
-            return None;
-        }
+    // Quotes are syntax only around a whole field; any other quote makes the line malformed.
+    let mut w = 0u32;
+    for i in 0..N {
+        let (s, l) = out[i];
+        let q = ((l >= 2) & (*d.add(s) == b'"') & (*d.add(s + l).sub(1) == b'"')) as usize;
+        out[i] = (s + q, l - 2 * q);
+        w += q as u32;
+    }
+    if qc != 2 * w {
+        return None;
     }
     Some(out)
 }
