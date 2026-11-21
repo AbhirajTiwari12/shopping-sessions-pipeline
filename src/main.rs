@@ -33,14 +33,11 @@ const BLK: usize = 512;
 const POP: usize = 1 << 16;
 const DEAD_W: u64 = u64::MAX;
 
-/// One event: the person and the packed time and purchase, then what dedup needs.
+/// One event: the person, and the time and purchase packed in one word.
 #[repr(C)]
 struct Row {
     name: u64,
     w: u64,
-    key: u64,
-    ingest: u32,
-    best: u32,
 }
 
 struct EvState {
@@ -48,7 +45,6 @@ struct EvState {
     used: usize,
     cur: Vec<(usize, usize)>,
     lists: Vec<Vec<u32>>,
-    dups: Vec<(u32, u32)>,
     inserted: usize,
     crows: P<Click>,
     cused: usize,
@@ -64,20 +60,23 @@ struct ThreadOut {
     rows: P<Row>,
     lists: Vec<Vec<u32>>,
     left: Vec<u32>,
-    dups: Vec<(u32, u32)>,
     crows: P<Click>,
     clists: Vec<Vec<u32>>,
     cleft: Vec<u32>,
 }
 
+/// The dedup table: open addressing, one slot per event_id. Word 0 is the ID; word 1 is
+/// the smallest ingest_ts seen for it (high half) and where that copy's row is (low half,
+/// location + 1, or NO_ROW when the copy is invalid and has no row).
 struct TableCtx<'a> {
-    table: P<AtomicU64>,
+    table: P<[AtomicU64; 2]>,
     mask: usize,
     tshift: u32,
-    tag_mask: u32,
+    bases: &'a [P<Row>],
+    lshift: u32,
     loc_base: u32,
-    _p: std::marker::PhantomData<&'a ()>,
 }
+const NO_ROW: u32 = u32::MAX;
 
 /// Lock-free union-find over the IDs in links, in an open-addressing table.
 /// Word 0 of a slot is the ID; word 1 is the parent slot + 1 while building (0 for a
@@ -485,16 +484,13 @@ fn main() {
     let tb = nthreads.next_power_of_two().trailing_zeros();
     let lshift = 32 - tb;
     assert!((row_cap as u64) + 1 < (1u64 << lshift), "too many events for this build");
-    let lmask = (1u32 << lshift) - 1;
-
-    let tag_mask = std::env::var("FORCE_TAG_MASK").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(u32::MAX);
 
     // Phase 2: parse events and clicks.
     let njobs = ev_chunks.len() + cl_chunks.len();
     let mut outs: Vec<ThreadOut>;
     loop {
         let slots = 1usize << tbits;
-        let table = P(alloc_zeroed::<AtomicU64>(slots));
+        let table = P(alloc_zeroed::<[AtomicU64; 2]>(slots));
         let limit = if tbits >= g_bits { usize::MAX } else { slots / 5 * 4 };
         let inserted = AtomicUsize::new(0);
         let abort = std::sync::atomic::AtomicBool::new(false);
@@ -510,9 +506,8 @@ fn main() {
                     let mut st = EvState {
                         rows: rows[tid],
                         used: 0,
-                        cur: vec![(0, 0); nparts + 1],
-                        lists: (0..nparts + 1).map(|_| Vec::new()).collect(),
-                        dups: Vec::new(),
+                        cur: vec![(0, 0); nparts],
+                        lists: (0..nparts).map(|_| Vec::new()).collect(),
                         inserted: 0,
                         crows: P(alloc_zeroed::<Click>(cl_bytes / 8 + 16 + (nparts + 1) * BLK)),
                         cused: 0,
@@ -524,7 +519,7 @@ fn main() {
                         click_cap: cl_bytes / 8 + 16 + (nparts + 1) * BLK,
                     };
                     populate(unsafe { table.p().add(slots / nthreads * tid) }, slots / nthreads);
-                    let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, tag_mask, loc_base: (tid as u32) << lshift, _p: std::marker::PhantomData };
+                    let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, bases: rows, lshift, loc_base: (tid as u32) << lshift };
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
                         if j >= njobs || abort.load(Ordering::Relaxed) {
@@ -548,7 +543,6 @@ fn main() {
                         rows: st.rows,
                         left: st.cur.iter().map(|c| c.1 as u32).collect(),
                         lists: st.lists,
-                        dups: st.dups,
                         crows: st.crows,
                         cleft: st.ccur.iter().map(|c| c.1 as u32).collect(),
                         clists: st.clists,
@@ -564,9 +558,9 @@ fn main() {
         }
         // The estimate was too low: start over with a bigger table.
         unsafe {
-            libc::munmap(table.p() as *mut libc::c_void, slots * 8);
+            libc::munmap(table.p() as *mut libc::c_void, slots * 16);
             for t in 0..nthreads {
-                libc::munmap(rows[t].p() as *mut libc::c_void, row_cap * 32);
+                libc::munmap(rows[t].p() as *mut libc::c_void, row_cap * 16);
             }
         }
         tbits += 1;
@@ -574,77 +568,6 @@ fn main() {
     }
     lap("parse");
 
-    // Dedup: of the copies of an event, the one with the smallest ingest_ts survives.
-    // Each group of copies is handled by one thread, chosen by its first copy.
-    let odd: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|sc| {
-        for w in 0..nthreads {
-            let (outs, odd) = (&outs, &odd);
-            sc.spawn(move || unsafe {
-                let di = |loc: u32| -> *mut Row { outs[(loc >> lshift) as usize].rows.p().add((loc & lmask) as usize) };
-                let mut my_odd: Vec<u32> = Vec::new();
-                const AHEAD: usize = 12;
-                for o in outs.iter() {
-                    let d = &o.dups;
-                    for i in 0..d.len() {
-                        if i + AHEAD < d.len() {
-                            let (pf, pm) = d[i + AHEAD];
-                            if pf as usize % nthreads == w {
-                                prefetch_w(di(pf));
-                                prefetch_w(di(pm));
-                            }
-                        }
-                        let (first, me) = d[i];
-                        if first as usize % nthreads != w {
-                            continue;
-                        }
-                        let f = di(first);
-                        let m = di(me);
-                        if (*m).key != (*f).key {
-                            // Only the hash tags matched: not a copy of that row.
-                            my_odd.push(me);
-                            continue;
-                        }
-                        let b = if (*f).best == 0 { first } else { (*f).best - 1 };
-                        if (*m).ingest < (*di(b)).ingest {
-                            (*di(b)).w = DEAD_W;
-                            (*f).best = me + 1;
-                        } else {
-                            (*m).w = DEAD_W;
-                        }
-                    }
-                }
-                if !my_odd.is_empty() {
-                    odd.lock().unwrap().extend_from_slice(&my_odd);
-                }
-            });
-        }
-    });
-    // Rows that only shared a tag never entered the table; dedup them among themselves.
-    let odd = odd.into_inner().unwrap();
-    if !odd.is_empty() {
-        let di = |loc: u32| -> *mut Row { unsafe { outs[(loc >> lshift) as usize].rows.p().add((loc & lmask) as usize) } };
-        let mut best: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        for &me in &odd {
-            unsafe {
-                match best.entry((*di(me)).key) {
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(me);
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        let b = *e.get();
-                        if (*di(me)).ingest < (*di(b)).ingest {
-                            (*di(b)).w = DEAD_W;
-                            e.insert(me);
-                        } else {
-                            (*di(me)).w = DEAD_W;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    lap("dedup");
     let ev_parts = &outs;
 
     // Phase 3: per partition, sort by person and time, sessionize, attribute.
@@ -1213,56 +1136,79 @@ struct Pending {
     user: u64,
     w: u64,
     slot: usize,
-    tag: u32,
     ingest: u32,
 }
 
-/// Resolves the row's person, writes it to its partition and enters it in the dedup table.
+/// Resolves the row's person, writes it to its partition and enters it in the dedup
+/// table. Of the copies of an event only the one with the smallest ingest_ts keeps a
+/// live row: a later, smaller copy takes the slot over and kills the earlier row.
 #[inline(always)]
 unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending) {
-    let (name, p) = if pe.w != DEAD_W {
+    // Write the row first, without claiming its place: it only stays if it wins.
+    let mut cursor: *mut (usize, usize) = std::ptr::null_mut();
+    let mut low = NO_ROW;
+    if pe.w != DEAD_W {
         let name = links.get(pe.user);
-        (name, (mix(name) >> st.pshift) as usize)
-    } else {
-        (0, st.nparts)
-    };
-    let c = st.cur.get_unchecked_mut(p);
-    if c.1 == 0 {
-        if st.used % POP == 0 {
-            populate(st.rows.p().add(st.used), POP.min(st.row_cap - st.used));
+        let p = (mix(name) >> st.pshift) as usize;
+        let c = st.cur.get_unchecked_mut(p);
+        if c.1 == 0 {
+            if st.used % POP == 0 {
+                populate(st.rows.p().add(st.used), POP.min(st.row_cap - st.used));
+            }
+            st.lists.get_unchecked_mut(p).push(st.used as u32);
+            c.0 = st.used;
+            c.1 = BLK;
+            st.used += BLK;
         }
-        st.lists.get_unchecked_mut(p).push(st.used as u32);
-        c.0 = st.used;
-        c.1 = BLK;
-        st.used += BLK;
+        let idx = c.0;
+        st.rows.p().add(idx).write(Row { name, w: pe.w });
+        low = (t.loc_base | idx as u32) + 1;
+        cursor = c;
     }
-    let idx = c.0;
-    c.0 += 1;
-    c.1 -= 1;
-    st.rows.p().add(idx).write(Row { name, w: pe.w, key: pe.key, ingest: pe.ingest, best: 0 });
-    // The next line of this partition's stream, so the store never waits on a miss.
-    prefetch_w(st.rows.p().add(idx + 2));
-    st.inserted += 1;
-    let loc = t.loc_base | idx as u32;
-    let tag = pe.tag & t.tag_mask;
-    let val = ((tag as u64) << 32) | (loc as u64 + 1);
+    let mine = ((pe.ingest as u64) << 32) | low as u64;
     let mut i = pe.slot;
     loop {
         let slot = &*t.table.p().add(i);
-        let mut cur = slot.load(Ordering::Acquire);
-        if cur == 0 {
-            match slot.compare_exchange(0, val, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return,
-                Err(x) => cur = x,
+        let mut k = slot[0].load(Ordering::Acquire);
+        if k == 0 {
+            match slot[0].compare_exchange(0, pe.key, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    slot[1].store(mine, Ordering::Release);
+                    st.inserted += 1;
+                    break;
+                }
+                Err(x) => k = x,
             }
         }
-        if (cur >> 32) as u32 == tag {
-            // Very likely a copy of that row. The keys are compared after parsing, where
-            // the other row can be fetched ahead of time; a row never waits on it here.
-            st.dups.push(((cur as u32) - 1, loc));
-            return;
+        if k == pe.key {
+            loop {
+                let v = slot[1].load(Ordering::Acquire);
+                if v == 0 {
+                    // The thread that claimed the slot is about to fill it in.
+                    std::hint::spin_loop();
+                    continue;
+                }
+                if pe.ingest >= (v >> 32) as u32 {
+                    // An earlier-ingested (or identical) copy exists: this row is dropped.
+                    return;
+                }
+                if slot[1].compare_exchange(v, mine, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    let old = v as u32;
+                    if old != NO_ROW {
+                        let loc = old - 1;
+                        let lmask = (1u32 << t.lshift) - 1;
+                        (*t.bases.get_unchecked((loc >> t.lshift) as usize).p().add((loc & lmask) as usize)).w = DEAD_W;
+                    }
+                    break;
+                }
+            }
+            break;
         }
         i = (i + 1) & t.mask;
+    }
+    if !cursor.is_null() {
+        (*cursor).0 += 1;
+        (*cursor).1 -= 1;
     }
 }
 
@@ -1271,7 +1217,7 @@ unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &Tabl
     let mut dc = DateCache::new();
     let mut n = 0usize;
     const RING: usize = 16;
-    let mut ring = [Pending { key: 0, user: 0, w: 0, slot: 0, tag: 0, ingest: 0 }; RING];
+    let mut ring = [Pending { key: 0, user: 0, w: 0, slot: 0, ingest: 0 }; RING];
     let (ws, we) = (ctx.ws, ctx.we);
     scan_lines(d, m.len, c.start, c.end, |ls, commas, nf, nl, qc| {
         let Some(f) = fields::<7>(d, ls, commas, nf, nl, qc) else { return };
@@ -1281,7 +1227,7 @@ unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &Tabl
         let key = pack(d.add(f[0].0), f[0].1);
         let ing = parse_f1(d.add(f[3].0), f[3].1, &mut dc);
         let h = mix(key);
-        let mut pe = Pending { key, user: 0, w: DEAD_W, slot: (h >> t.tshift) as usize, tag: h as u32, ingest: u32::MAX };
+        let mut pe = Pending { key, user: 0, w: DEAD_W, slot: (h >> t.tshift) as usize, ingest: u32::MAX };
         prefetch_w(t.table.p().add(pe.slot));
         if ing != INVALID {
             pe.ingest = (ing / 1000).clamp(0, (u32::MAX - 1) as i64) as u32;
