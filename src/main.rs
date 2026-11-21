@@ -369,12 +369,12 @@ fn load_lookups(data_dir: &Path, ws: i64, we: i64) -> (Ctx, Vec<Vec<u8>>, Vec<(V
 
 #[derive(Default)]
 struct UserOut {
-    ids: Vec<u8>,
-    day: Vec<i32>,
-    sessions: Vec<i32>,
-    events: Vec<i32>,
-    revenue: Vec<i64>,
-    cat: Vec<u8>,
+    ids: HVec<u8>,
+    day: HVec<i32>,
+    sessions: HVec<i32>,
+    events: HVec<i32>,
+    revenue: HVec<i64>,
+    cat: HVec<u8>,
 }
 
 fn main() {

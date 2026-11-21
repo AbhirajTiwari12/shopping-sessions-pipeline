@@ -1050,3 +1050,66 @@ impl ReadBuf {
         }
     }
 }
+
+// ---------------------------------------------------------------- growable huge-page buffer
+
+/// A growable buffer on huge-page-backed anonymous memory (the allocator's own memory
+/// never gets huge pages). Never freed.
+pub struct HVec<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+    cap: usize,
+}
+unsafe impl<T: Copy> Send for HVec<T> {}
+impl<T: Copy> Default for HVec<T> {
+    fn default() -> Self {
+        HVec { ptr: std::ptr::NonNull::dangling().as_ptr(), len: 0, cap: 0 }
+    }
+}
+impl<T: Copy> HVec<T> {
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, extra: usize) {
+        let need = self.len + extra;
+        let cap = (self.cap * 2).max(need).max((2 << 20) / std::mem::size_of::<T>().max(1));
+        let p = alloc_zeroed::<T>(cap);
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr, p, self.len) };
+        self.ptr = p;
+        self.cap = cap;
+    }
+    #[inline(always)]
+    pub fn reserve(&mut self, extra: usize) {
+        if self.len + extra > self.cap {
+            self.grow(extra);
+        }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, v: T) {
+        self.reserve(1);
+        unsafe { self.ptr.add(self.len).write(v) };
+        self.len += 1;
+    }
+    pub fn extend_from_slice(&mut self, s: &[T]) {
+        self.reserve(s.len());
+        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), self.ptr.add(self.len), s.len()) };
+        self.len += s.len();
+    }
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+    #[inline(always)]
+    pub unsafe fn set_len(&mut self, n: usize) {
+        self.len = n;
+    }
+}
+impl<T: Copy> std::ops::Deref for HVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
