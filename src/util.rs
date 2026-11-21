@@ -1003,7 +1003,7 @@ pub unsafe fn split_fields<const K: usize>(d: *const u8, seps: *const u32, start
 
 /// Whether inputs are read with pread() into a per-thread buffer backed by huge pages
 /// instead of being parsed from the file mapping. READ=1 / READ=0 override it.
-pub const DEFAULT_READ: bool = false;
+pub const DEFAULT_READ: bool = true;
 pub fn use_read() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| match std::env::var("READ") {
