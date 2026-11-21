@@ -836,8 +836,10 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
             let mut m = c | n;
             let cnt = m.count_ones() as usize;
             let out = buf.idx.as_mut_ptr().add(ni);
+            // Eight unconditional scalar stores (kept out of the vectorizer's hands:
+            // packing them into a vector costs more than the stores).
             for k in 0..8 {
-                *out.add(k) = off + m.trailing_zeros();
+                out.add(k).write_volatile(off + m.trailing_zeros());
                 m &= m.wrapping_sub(1);
             }
             if cnt > 8 {

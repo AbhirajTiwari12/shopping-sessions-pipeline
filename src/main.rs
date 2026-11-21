@@ -927,7 +927,7 @@ fn process_sub(sc: &mut Scratch, rows: &[[u64; 2]], clicks: &[Click], st: &mut P
         if c.len() > 1 {
             c.sort_unstable_by_key(|c| (c.ts, c.ckey));
         }
-        st.person(names[id], e, c, env.ws, env.day0, env.ndays, env.ncamp, agg, out);
+        unsafe { st.person(names[id], e, c, env.ws, env.day0, env.ndays, env.ncamp, agg, out) };
         es = ee;
         cs = ce;
     }
@@ -1086,7 +1086,7 @@ impl PersonState {
 
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
-    fn person(
+    unsafe fn person(
         &mut self,
         name: u64,
         ev: &[u64],
@@ -1115,7 +1115,7 @@ impl PersonState {
         let m = ev.len();
         let mut k = 0;
         while k < m {
-            let start = ev[k] >> 32;
+            let start = *ev.get_unchecked(k) >> 32;
             let day = day0 + ((ws - day0 * DAY_MS) as u64 + start) as i64 / DAY_MS;
             if day != cur_day {
                 self.flush(cur_day, d_sessions, d_events, d_rev, out);
@@ -1128,7 +1128,7 @@ impl PersonState {
             let mut rev = 0i64;
             let mut n = 0i32;
             while k < m {
-                let w = ev[k];
+                let w = *ev.get_unchecked(k);
                 let ts = w >> 32;
                 if ts - prev > GAP_MS {
                     break;
@@ -1139,10 +1139,10 @@ impl PersonState {
                 if price != 0 {
                     let cat = ((w >> 24) & 0xFF) as usize;
                     rev += price;
-                    if self.cat_sum[cat] == 0 {
+                    if *self.cat_sum.get_unchecked(cat) == 0 {
                         self.cat_touched.push(cat as u32);
                     }
-                    self.cat_sum[cat] += price;
+                    *self.cat_sum.get_unchecked_mut(cat) += price;
                 }
                 k += 1;
             }
@@ -1156,47 +1156,47 @@ impl PersonState {
             if di != cur_di {
                 // first[d] is the number of this person's sessions before day d.
                 if cur_di == usize::MAX {
-                    self.first[di] = 0;
+                    *self.first.get_unchecked_mut(di) = 0;
                 } else {
                     for d in cur_di + 1..=di {
-                        self.first[d] = nsess;
+                        *self.first.get_unchecked_mut(d) = nsess;
                     }
                 }
                 cur_di = di;
             }
-            while hi < cl.len() && cl[hi].ts as u64 <= s {
-                let c = cl[hi].camp as usize;
-                if self.cnt[c] == 0 {
+            while hi < cl.len() && cl.get_unchecked(hi).ts as u64 <= s {
+                let c = cl.get_unchecked(hi).camp as usize;
+                if *self.cnt.get_unchecked(c) == 0 {
                     // The campaign assists every session from this one until its clicks age out.
-                    self.since[c] = (nsess, di as u32);
+                    *self.since.get_unchecked_mut(c) = (nsess, di as u32);
                     self.active.push(c as u32);
                 }
-                self.cnt[c] += 1;
+                *self.cnt.get_unchecked_mut(c) += 1;
                 hi += 1;
             }
-            while lo < hi && (cl[lo].ts as u64) + (WEEK_MS as u64) < s {
-                let c = cl[lo].camp as usize;
-                self.cnt[c] -= 1;
-                if self.cnt[c] == 0 {
+            while lo < hi && (cl.get_unchecked(lo).ts as u64) + (WEEK_MS as u64) < s {
+                let c = cl.get_unchecked(lo).camp as usize;
+                *self.cnt.get_unchecked_mut(c) -= 1;
+                if *self.cnt.get_unchecked(c) == 0 {
                     self.assists(c, nsess, cur_di, ndays, agg);
                 }
                 lo += 1;
             }
             let camp = if hi > lo {
-                let t = cl[hi - 1].ts;
+                let t = cl.get_unchecked(hi - 1).ts;
                 let mut best = hi - 1;
                 let mut g = hi - 1;
-                while g > lo && cl[g - 1].ts == t {
+                while g > lo && cl.get_unchecked(g - 1).ts == t {
                     g -= 1;
-                    if key_lt(cl[g].ckey, cl[best].ckey) {
+                    if key_lt(cl.get_unchecked(g).ckey, cl.get_unchecked(best).ckey) {
                         best = g;
                     }
                 }
-                cl[best].camp as usize
+                cl.get_unchecked(best).camp as usize
             } else {
                 ncamp
             };
-            let a = &mut agg[camp * ndays + di];
+            let a = agg.get_unchecked_mut(camp * ndays + di);
             a[0] += 1;
             a[1] += (rev > 0) as i64;
             a[2] += rev;
@@ -1216,13 +1216,13 @@ impl PersonState {
     /// Campaign `c` assisted this person's sessions numbered since[c].0 up to `end`
     /// (exclusive): count them on their days.
     #[inline(always)]
-    fn assists(&self, c: usize, end: u32, cur_di: usize, ndays: usize, agg: &mut [[i64; 4]]) {
-        let (a, sd) = self.since[c];
+    unsafe fn assists(&self, c: usize, end: u32, cur_di: usize, ndays: usize, agg: &mut [[i64; 4]]) {
+        let (a, sd) = *self.since.get_unchecked(c);
         for d in sd as usize..=cur_di {
-            let lo = a.max(self.first[d]);
-            let hi = if d < cur_di { self.first[d + 1] } else { end };
+            let lo = a.max(*self.first.get_unchecked(d));
+            let hi = if d < cur_di { *self.first.get_unchecked(d + 1) } else { end };
             if hi > lo {
-                agg[c * ndays + d][3] += (hi - lo) as i64;
+                agg.get_unchecked_mut(c * ndays + d)[3] += (hi - lo) as i64;
             }
         }
     }
