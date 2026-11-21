@@ -749,3 +749,164 @@ pub unsafe fn fields<const N: usize>(
     }
     Some(out)
 }
+
+// ---------------------------------------------------------------- batched scanning
+
+/// Bytes scanned per batch: separator positions for about this much input are
+/// collected first, then the lines are decoded from them.
+pub const BATCH: usize = 8 << 10;
+
+/// Reusable buffers for `scan_batches`.
+pub struct ScanBuf {
+    idx: Vec<u32>,
+    nlp: Vec<u32>,
+    qcum: Vec<u32>,
+}
+impl ScanBuf {
+    pub fn new() -> Self {
+        ScanBuf { idx: vec![0; BATCH * 2 + 256], nlp: vec![0; BATCH + 256], qcum: vec![0; BATCH + 256] }
+    }
+}
+
+pub trait LineSink {
+    /// A line with exactly the expected number of commas. `seps` points at the offsets
+    /// (relative to `base`) of its commas; the line spans `ls..nl` and holds `qc` quotes.
+    unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32);
+    /// Called after the lines of a batch.
+    unsafe fn flush(&mut self);
+}
+
+/// Like `scan_lines`, for lines of `K` fields, in two stages per batch: first the
+/// positions of all commas and newlines are written out, then each line is handed to
+/// the sink. Lines with another number of commas are skipped (they are malformed).
+#[inline(always)]
+pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: usize, start: usize, end: usize, buf: &mut ScanBuf, sink: &mut S) {
+    if flen == 0 || start >= flen {
+        return;
+    }
+    let mut b = if start == 0 { 0 } else { start - 1 };
+    let line_start;
+    loop {
+        if b >= flen {
+            return;
+        }
+        let (_, _, n) = masks64(data.add(b));
+        if n != 0 {
+            line_start = b + n.trailing_zeros() as usize + 1;
+            break;
+        }
+        b += 64;
+    }
+    if line_start >= end || line_start >= flen {
+        return;
+    }
+    let base = line_start;
+    b = line_start;
+    let mut ls = line_start;
+    let (mut ni, mut nn) = (0usize, 0usize);
+    let (mut qrun, mut qprev) = (0u32, 0u32);
+    let mut done_scan = false;
+    loop {
+        // Stage 1: separator positions for the next batch of input.
+        let target = b + BATCH;
+        while b < target && !done_scan {
+            if ni + 72 > buf.idx.len() {
+                let n = buf.idx.len() * 2;
+                buf.idx.resize(n, 0);
+            }
+            if nn + 66 > buf.nlp.len() {
+                let n = buf.nlp.len() * 2;
+                buf.nlp.resize(n, 0);
+                buf.qcum.resize(n, 0);
+            }
+            let (c, q, mut n) = masks64(data.add(b));
+            // The end of the file acts as a final newline.
+            if flen - b < 64 {
+                n |= 1u64 << (flen - b);
+            }
+            let off = (b - base) as u32;
+            let mut m = c | n;
+            let cnt = m.count_ones() as usize;
+            let out = buf.idx.as_mut_ptr().add(ni);
+            for k in 0..8 {
+                *out.add(k) = off + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+            }
+            if cnt > 8 {
+                let mut k = 8;
+                while m != 0 {
+                    *out.add(k) = off + m.trailing_zeros();
+                    m &= m - 1;
+                    k += 1;
+                }
+            }
+            ni += cnt;
+            let mut nm = n;
+            while nm != 0 {
+                let i = nm.trailing_zeros();
+                *buf.nlp.as_mut_ptr().add(nn) = off + i;
+                *buf.qcum.as_mut_ptr().add(nn) = qrun + (q & ((1u64 << i) - 1)).count_ones();
+                nn += 1;
+                nm &= nm - 1;
+            }
+            qrun += q.count_ones();
+            b += 64;
+            // Lines that start at or after `end` belong to the next chunk.
+            if nn > 0 && base + *buf.nlp.as_ptr().add(nn - 1) as usize + 1 >= end {
+                done_scan = true;
+            }
+            if b > flen {
+                done_scan = true;
+            }
+        }
+        // No stale entry may pass for a newline.
+        for k in 0..8 {
+            *buf.idx.as_mut_ptr().add(ni + k) = u32::MAX;
+        }
+        // Stage 2: the lines.
+        let idx = buf.idx.as_ptr();
+        let mut ip = 0usize;
+        let mut finished = false;
+        for j in 0..nn {
+            if ls >= end {
+                finished = true;
+                break;
+            }
+            let nlo = *buf.nlp.as_ptr().add(j);
+            let nl = base + nlo as usize;
+            let qc = *buf.qcum.as_ptr().add(j) - qprev;
+            qprev = *buf.qcum.as_ptr().add(j);
+            if *idx.add(ip + K - 1) == nlo {
+                sink.line(ls, idx.add(ip), base, nl, qc);
+                ip += K;
+            } else {
+                while *idx.add(ip) != nlo {
+                    ip += 1;
+                }
+                ip += 1;
+            }
+            ls = nl + 1;
+        }
+        sink.flush();
+        if finished || done_scan {
+            break;
+        }
+        // Separators of the line still open move to the front.
+        let rem = ni - ip;
+        std::ptr::copy(buf.idx.as_ptr().add(ip), buf.idx.as_mut_ptr(), rem);
+        ni = rem;
+        nn = 0;
+    }
+}
+
+/// One field of a line: strips the quotes around it and counts them in `$wq`.
+/// Gives (start, length).
+#[macro_export]
+macro_rules! field {
+    ($d:expr, $wq:ident, $s:expr, $e:expr) => {{
+        let (s, e): (usize, usize) = ($s, $e);
+        let q = ((e - s >= 2) & (*$d.add(s) == b'"') & (*$d.add(e).sub(1) == b'"')) as usize;
+        $wq += q;
+        (s + q, e - s - 2 * q)
+    }};
+}
