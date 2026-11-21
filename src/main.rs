@@ -65,9 +65,9 @@ struct TableCtx<'a> {
     table: P<AtomicU64>,
     mask: usize,
     tshift: u32,
-    bases: &'a [P<Row>],
-    lshift: u32,
+    tag_mask: u32,
     loc_base: u32,
+    _p: std::marker::PhantomData<&'a ()>,
 }
 
 /// Lock-free union-find over the IDs in links, in an open-addressing table.
@@ -379,6 +379,17 @@ fn main() {
     let (ev_chunks, ev_bytes) = cut(&ev_files, CHUNK);
     let (cl_chunks, _cl_bytes) = cut(&cl_files, CHUNK);
     let (ln_chunks, _) = cut(&ln_files, 1 << 20);
+    // Ask the kernel to start reading everything now, in the order it will be parsed.
+    #[cfg(target_os = "linux")]
+    if std::env::var("NO_READAHEAD").is_err() {
+        let ranges: Vec<(usize, usize)> =
+            ln_files.iter().chain(cl_files.iter()).chain(ev_files.iter()).filter(|m| m.len > 0).map(|m| (m.ptr as usize, m.len)).collect();
+        std::thread::spawn(move || {
+            for (p, len) in ranges {
+                unsafe { libc::madvise(p as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+            }
+        });
+    }
     lap("setup");
 
     // Phase 1: links. Every ID in a link maps to its person's name.
@@ -424,6 +435,8 @@ fn main() {
     assert!((row_cap as u64) + 1 < (1u64 << lshift), "too many events for this build");
     let lmask = (1u32 << lshift) - 1;
 
+    let tag_mask = std::env::var("FORCE_TAG_MASK").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(u32::MAX);
+
     // Phase 2: parse events and clicks.
     let njobs = ev_chunks.len() + cl_chunks.len();
     let mut outs: Vec<ThreadOut>;
@@ -453,7 +466,7 @@ fn main() {
                         nparts,
                         pshift,
                     };
-                    let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, bases: rows, lshift, loc_base: (tid as u32) << lshift };
+                    let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, tag_mask, loc_base: (tid as u32) << lshift, _p: std::marker::PhantomData };
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
                         if j >= njobs || abort.load(Ordering::Relaxed) {
@@ -503,30 +516,74 @@ fn main() {
 
     // Dedup: of the copies of an event, the one with the smallest ingest_ts survives.
     // Each group of copies is handled by one thread, chosen by its first copy.
+    let odd: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|sc| {
         for w in 0..nthreads {
-            let outs = &outs;
+            let (outs, odd) = (&outs, &odd);
             sc.spawn(move || unsafe {
                 let di = |loc: u32| -> *mut Row { outs[(loc >> lshift) as usize].rows.p().add((loc & lmask) as usize) };
-                let kill = |loc: u32| (*di(loc)).w = DEAD_W;
+                let mut my_odd: Vec<u32> = Vec::new();
+                const AHEAD: usize = 12;
                 for o in outs.iter() {
-                    for &(first, me) in &o.dups {
+                    let d = &o.dups;
+                    for i in 0..d.len() {
+                        if i + AHEAD < d.len() {
+                            let (pf, pm) = d[i + AHEAD];
+                            if pf as usize % nthreads == w {
+                                prefetch_w(di(pf));
+                                prefetch_w(di(pm));
+                            }
+                        }
+                        let (first, me) = d[i];
                         if first as usize % nthreads != w {
                             continue;
                         }
                         let f = di(first);
+                        let m = di(me);
+                        if (*m).key != (*f).key {
+                            // Only the hash tags matched: not a copy of that row.
+                            my_odd.push(me);
+                            continue;
+                        }
                         let b = if (*f).best == 0 { first } else { (*f).best - 1 };
-                        if (*di(me)).ingest < (*di(b)).ingest {
-                            kill(b);
+                        if (*m).ingest < (*di(b)).ingest {
+                            (*di(b)).w = DEAD_W;
                             (*f).best = me + 1;
                         } else {
-                            kill(me);
+                            (*m).w = DEAD_W;
                         }
                     }
+                }
+                if !my_odd.is_empty() {
+                    odd.lock().unwrap().extend_from_slice(&my_odd);
                 }
             });
         }
     });
+    // Rows that only shared a tag never entered the table; dedup them among themselves.
+    let odd = odd.into_inner().unwrap();
+    if !odd.is_empty() {
+        let di = |loc: u32| -> *mut Row { unsafe { outs[(loc >> lshift) as usize].rows.p().add((loc & lmask) as usize) } };
+        let mut best: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for &me in &odd {
+            unsafe {
+                match best.entry((*di(me)).key) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(me);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let b = *e.get();
+                        if (*di(me)).ingest < (*di(b)).ingest {
+                            (*di(b)).w = DEAD_W;
+                            e.insert(me);
+                        } else {
+                            (*di(me)).w = DEAD_W;
+                        }
+                    }
+                }
+            }
+        }
+    }
     lap("dedup");
     let ev_parts = &outs;
 
@@ -709,7 +766,8 @@ fn process_sub(sc: &mut Scratch, rows: &[[u64; 2]], clicks: &[Click], st: &mut P
     }
     off.push(acc);
     ev.clear();
-    ev.resize(n, 0);
+    ev.reserve(n);
+    unsafe { ev.set_len(n) };
     for (r, &id) in rows.iter().zip(ids.iter()) {
         let id = id as usize;
         ev[off[id] as usize] = r[1];
@@ -832,6 +890,8 @@ impl LocalMap {
 
 struct PersonState {
     cnt: Vec<u32>,
+    since: Vec<(u32, u32)>,
+    first: Vec<u32>,
     active: Vec<u32>,
     cat_sum: Vec<i64>,
     cat_touched: Vec<u32>,
@@ -842,6 +902,8 @@ impl PersonState {
     fn new(ncamp: usize, ncat: usize) -> Self {
         PersonState {
             cnt: vec![0; ncamp + 1],
+            since: vec![(0, 0); ncamp + 1],
+            first: Vec::new(),
             active: Vec::new(),
             cat_sum: vec![0; ncat],
             cat_touched: Vec::new(),
@@ -892,6 +954,11 @@ impl PersonState {
         unpack(name, &mut self.name_buf);
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut cur_day = i64::MIN;
+        let mut cur_di = usize::MAX;
+        let mut nsess = 0u32;
+        if self.first.len() < ndays + 1 {
+            self.first.resize(ndays + 1, 0);
+        }
         let (mut d_sessions, mut d_events, mut d_rev) = (0i32, 0i32, 0i64);
         let m = ev.len();
         let mut k = 0;
@@ -934,16 +1001,33 @@ impl PersonState {
             debug_assert!(di < ndays);
             // Clicks are timed from window_start - 7 days.
             let s = start + WEEK_MS as u64;
+            if di != cur_di {
+                // first[d] is the number of this person's sessions before day d.
+                if cur_di == usize::MAX {
+                    self.first[di] = 0;
+                } else {
+                    for d in cur_di + 1..=di {
+                        self.first[d] = nsess;
+                    }
+                }
+                cur_di = di;
+            }
             while hi < cl.len() && cl[hi].ts as u64 <= s {
                 let c = cl[hi].camp as usize;
                 if self.cnt[c] == 0 {
+                    // The campaign assists every session from this one until its clicks age out.
+                    self.since[c] = (nsess, di as u32);
                     self.active.push(c as u32);
                 }
                 self.cnt[c] += 1;
                 hi += 1;
             }
             while lo < hi && (cl[lo].ts as u64) + (WEEK_MS as u64) < s {
-                self.cnt[cl[lo].camp as usize] -= 1;
+                let c = cl[lo].camp as usize;
+                self.cnt[c] -= 1;
+                if self.cnt[c] == 0 {
+                    self.assists(c, nsess, cur_di, ndays, agg);
+                }
                 lo += 1;
             }
             let camp = if hi > lo {
@@ -956,35 +1040,39 @@ impl PersonState {
                         best = g;
                     }
                 }
-                // Assists: every campaign with a click in the window, once.
-                let mut w = 0;
-                for r in 0..self.active.len() {
-                    let c = self.active[r];
-                    if self.cnt[c as usize] > 0 {
-                        agg[c as usize * ndays + di][3] += 1;
-                        self.active[w] = c;
-                        w += 1;
-                    }
-                }
-                self.active.truncate(w);
                 cl[best].camp as usize
             } else {
-                for &c in &self.active {
-                    self.cnt[c as usize] = 0;
-                }
-                self.active.clear();
                 ncamp
             };
             let a = &mut agg[camp * ndays + di];
             a[0] += 1;
             a[1] += (rev > 0) as i64;
             a[2] += rev;
+            nsess += 1;
         }
         self.flush(cur_day, d_sessions, d_events, d_rev, out);
-        for &c in &self.active {
-            self.cnt[c as usize] = 0;
+        for i in 0..self.active.len() {
+            let c = self.active[i] as usize;
+            if self.cnt[c] > 0 {
+                self.assists(c, nsess, cur_di, ndays, agg);
+                self.cnt[c] = 0;
+            }
         }
         self.active.clear();
+    }
+
+    /// Campaign `c` assisted this person's sessions numbered since[c].0 up to `end`
+    /// (exclusive): count them on their days.
+    #[inline(always)]
+    fn assists(&self, c: usize, end: u32, cur_di: usize, ndays: usize, agg: &mut [[i64; 4]]) {
+        let (a, sd) = self.since[c];
+        for d in sd as usize..=cur_di {
+            let lo = a.max(self.first[d]);
+            let hi = if d < cur_di { self.first[d + 1] } else { end };
+            if hi > lo {
+                agg[c * ndays + d][3] += (hi - lo) as i64;
+            }
+        }
     }
 }
 
@@ -1059,8 +1147,8 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
     prefetch_w(st.rows.p().add(idx + 2));
     st.inserted += 1;
     let loc = t.loc_base | idx as u32;
-    let val = ((pe.tag as u64) << 32) | (loc as u64 + 1);
-    let lmask = (1u32 << t.lshift) - 1;
+    let tag = pe.tag & t.tag_mask;
+    let val = ((tag as u64) << 32) | (loc as u64 + 1);
     let mut i = pe.slot;
     loop {
         let slot = &*t.table.p().add(i);
@@ -1071,13 +1159,11 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
                 Err(x) => cur = x,
             }
         }
-        if (cur >> 32) as u32 == pe.tag {
-            let other = (cur as u32) - 1;
-            let o = t.bases.get_unchecked((other >> t.lshift) as usize).p().add((other & lmask) as usize);
-            if (*o).key == pe.key {
-                st.dups.push((other, loc));
-                return;
-            }
+        if (cur >> 32) as u32 == tag {
+            // Very likely a copy of that row. The keys are compared after parsing, where
+            // the other row can be fetched ahead of time; a row never waits on it here.
+            st.dups.push(((cur as u32) - 1, loc));
+            return;
         }
         i = (i + 1) & t.mask;
     }
