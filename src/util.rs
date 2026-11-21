@@ -934,10 +934,14 @@ macro_rules! field {
 /// `seps[0..K]` those ending its fields, as offsets from `d`. Fills the start (offset
 /// from `d`) and length of every field, quotes stripped, and returns how many fields
 /// are wrapped in quotes: the line is well formed when its quotes are exactly twice that.
+/// Whether `split_fields` uses a vector gather. Gathers are slow on some CPUs (and
+/// mitigations make them slower on others), so the scalar walk is the default.
+pub const USE_GATHER: bool = false;
+
 #[inline(always)]
 pub unsafe fn split_fields<const K: usize>(d: *const u8, seps: *const u32, starts: &mut [u32; 8], lens: &mut [u32; 8]) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
+    if USE_GATHER {
         use std::arch::x86_64::*;
         const LANES: [i32; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0];
         let lanes = _mm256_loadu_si256(LANES.as_ptr().add(8 - K) as *const __m256i);
@@ -961,18 +965,19 @@ pub unsafe fn split_fields<const K: usize>(d: *const u8, seps: *const u32, start
         _mm256_storeu_si256(lens.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(len, _mm256_add_epi32(w, w)));
         return (_mm256_movemask_ps(_mm256_castsi256_ps(w)) as u32).count_ones();
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    {
-        let mut wq = 0u32;
-        for k in 0..K {
-            let s = (*seps.add(k).sub(1)).wrapping_add(1);
-            let e = *seps.add(k);
-            let len = e.wrapping_sub(s);
-            let q = ((len >= 2) & (*d.offset(s as i32 as isize) == b'"') & (*d.offset(e as i32 as isize - 1) == b'"')) as u32;
-            starts[k] = s + q;
-            lens[k] = len - 2 * q;
-            wq += q;
-        }
-        wq
+    let mut wq = 0u32;
+    let mut p = *seps.sub(1);
+    for k in 0..K {
+        let e = *seps.add(k);
+        let s = p.wrapping_add(1);
+        let len = e.wrapping_sub(s);
+        // An empty field's "first byte" is its separator, never a quote; a lone quote
+        // is not a wrapper.
+        let q = ((*d.offset(s as i32 as isize) == b'"') & (*d.offset(e as i32 as isize - 1) == b'"') & (len != 1)) as u32;
+        *starts.get_unchecked_mut(k) = s + q;
+        *lens.get_unchecked_mut(k) = len - 2 * q;
+        wq += q;
+        p = e;
     }
+    wq
 }
