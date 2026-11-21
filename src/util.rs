@@ -1113,3 +1113,20 @@ impl<T: Copy> std::ops::Deref for HVec<T> {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
+
+/// Maps a range of a file mapping's pages in one kernel call, instead of one fault
+/// per 64 KiB as parsing walks through it. PREFAULT=0 turns it off.
+pub fn prefault_read(p: *const u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var("PREFAULT").map_or(DEFAULT_PREFAULT, |v| v != "0")) {
+            const MADV_POPULATE_READ: i32 = 22;
+            let start = (p as usize) & !0xFFF;
+            let end = (p as usize + len + 0xFFF) & !0xFFF;
+            libc::madvise(start as *mut libc::c_void, end - start, MADV_POPULATE_READ);
+        }
+    }
+    let _ = (p, len);
+}
+pub const DEFAULT_PREFAULT: bool = true;

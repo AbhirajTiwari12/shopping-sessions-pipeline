@@ -552,6 +552,7 @@ fn main() {
                                 let (m, s, e) = unsafe { rbuf.fill(&cl_files[c.file], c.start, c.end) };
                                 if ring { unsafe { parse_clicks_ring(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, links) } } else { unsafe { parse_clicks(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, links, &mut sbuf) } };
                             } else {
+                                prefault_read(unsafe { cl_files[c.file].ptr.add(c.start) }, c.end - c.start);
                                 if ring { unsafe { parse_clicks_ring(ctx, &cl_files[c.file], c, &mut st, links) } } else { unsafe { parse_clicks(ctx, &cl_files[c.file], c, &mut st, links, &mut sbuf) } };
                             }
                         } else {
@@ -561,6 +562,7 @@ fn main() {
                                 let (m, s, e) = unsafe { rbuf.fill(&ev_files[c.file], c.start, c.end) };
                                 if ring { unsafe { parse_events_ring(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, &tctx, links) } } else { unsafe { parse_events(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, &tctx, links, &mut sbuf) } };
                             } else {
+                                prefault_read(unsafe { ev_files[c.file].ptr.add(c.start) }, c.end - c.start);
                                 if ring { unsafe { parse_events_ring(ctx, &ev_files[c.file], c, &mut st, &tctx, links) } } else { unsafe { parse_events(ctx, &ev_files[c.file], c, &mut st, &tctx, links, &mut sbuf) } };
                             }
                             let n = st.inserted - before;
