@@ -425,7 +425,8 @@ fn main() {
         (chunks, bytes)
     };
     // CHUNK_KB shrinks the chunks, to exercise chunk boundaries in tests.
-    let chunk = std::env::var("CHUNK_KB").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).map_or(CHUNK, |n| (n << 10).min(CHUNK));
+    // Read mode uses chunks that stay in cache between the read and the parse.
+    let chunk = std::env::var("CHUNK_KB").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).map_or(if use_read() { 256 << 10 } else { CHUNK }, |n| (n << 10).min(CHUNK));
     let (ev_chunks, ev_bytes) = cut(&ev_files, chunk);
     let (cl_chunks, cl_bytes) = cut(&cl_files, chunk);
     let (ln_chunks, _) = cut(&ln_files, 1 << 20);
@@ -536,6 +537,8 @@ fn main() {
                     };
                     populate(unsafe { table.p().add(slots / nthreads * tid) }, slots / nthreads);
                     let mut sbuf = ScanBuf::new();
+                    let mut rbuf = ReadBuf::new();
+                    let read_mode = use_read();
                     let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, tag_mask, loc_base: (tid as u32) << lshift, _p: std::marker::PhantomData };
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
@@ -544,11 +547,21 @@ fn main() {
                         }
                         if j < cl_chunks.len() {
                             let c = &cl_chunks[j];
-                            unsafe { parse_clicks(ctx, &cl_files[c.file], c, &mut st, links, &mut sbuf) };
+                            if read_mode {
+                                let (m, s, e) = unsafe { rbuf.fill(&cl_files[c.file], c.start, c.end) };
+                                unsafe { parse_clicks(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, links, &mut sbuf) };
+                            } else {
+                                unsafe { parse_clicks(ctx, &cl_files[c.file], c, &mut st, links, &mut sbuf) };
+                            }
                         } else {
                             let c = &ev_chunks[j - cl_chunks.len()];
                             let before = st.inserted;
-                            unsafe { parse_events(ctx, &ev_files[c.file], c, &mut st, &tctx, links, &mut sbuf) };
+                            if read_mode {
+                                let (m, s, e) = unsafe { rbuf.fill(&ev_files[c.file], c.start, c.end) };
+                                unsafe { parse_events(ctx, &m, &Chunk { file: c.file, start: s, end: e }, &mut st, &tctx, links, &mut sbuf) };
+                            } else {
+                                unsafe { parse_events(ctx, &ev_files[c.file], c, &mut st, &tctx, links, &mut sbuf) };
+                            }
                             let n = st.inserted - before;
                             if inserted.fetch_add(n, Ordering::Relaxed) + n > limit {
                                 abort.store(true, Ordering::Relaxed);

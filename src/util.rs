@@ -8,6 +8,8 @@ use std::sync::Mutex;
 pub struct Map {
     pub ptr: *const u8,
     pub len: usize,
+    /// The open file (never closed), or -1 for a buffer that is not a mapping.
+    pub fd: i32,
 }
 unsafe impl Send for Map {}
 unsafe impl Sync for Map {}
@@ -17,7 +19,7 @@ const SLACK: usize = 1 << 16;
 /// Maps a file read-only with at least 64 KiB of readable zero bytes after its end,
 /// so vector loads may run past the last byte.
 pub fn map_file(path: &std::path::Path) -> Map {
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::io::{AsRawFd, IntoRawFd};
     let f = std::fs::File::open(path).expect("open input");
     let len = f.metadata().expect("stat").len() as usize;
     let total = (len + SLACK + 0xFFFF) & !0xFFFF;
@@ -42,7 +44,7 @@ pub fn map_file(path: &std::path::Path) -> Map {
             );
             assert!(p != libc::MAP_FAILED, "mmap file");
         }
-        Map { ptr: base as *const u8, len }
+        Map { ptr: base as *const u8, len, fd: f.into_raw_fd() }
     }
 }
 
@@ -995,4 +997,56 @@ pub unsafe fn split_fields<const K: usize>(d: *const u8, seps: *const u32, start
         p = e;
     }
     wq
+}
+
+// ---------------------------------------------------------------- reading into a buffer
+
+/// Whether inputs are read with pread() into a per-thread buffer backed by huge pages
+/// instead of being parsed from the file mapping. READ=1 / READ=0 override it.
+pub const DEFAULT_READ: bool = false;
+pub fn use_read() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("READ") {
+        Ok(v) => v != "0",
+        Err(_) => DEFAULT_READ,
+    })
+}
+
+/// A per-thread buffer that holds one chunk of a file plus the rest of its last line.
+pub struct ReadBuf {
+    ptr: *mut u8,
+    cap: usize,
+}
+impl ReadBuf {
+    pub fn new() -> Self {
+        ReadBuf { ptr: std::ptr::null_mut(), cap: 0 }
+    }
+    /// Reads what parsing the lines that start in `start..end` needs. Returns the buffer
+    /// as a small "file" and the chunk's bounds inside it.
+    pub unsafe fn fill(&mut self, m: &Map, start: usize, end: usize) -> (Map, usize, usize) {
+        let s0 = if start == 0 { 0 } else { start - 1 };
+        let mut want = (end - s0) + (64 << 10);
+        loop {
+            let n = want.min(m.len - s0);
+            if n + 256 > self.cap {
+                self.cap = (n + 256).next_power_of_two().max(1 << 21);
+                self.ptr = alloc_zeroed::<u8>(self.cap);
+            }
+            let mut got = 0usize;
+            while got < n {
+                let r = libc::pread(m.fd, self.ptr.add(got) as *mut libc::c_void, n - got, (s0 + got) as libc::off_t);
+                assert!(r > 0, "pread");
+                got += r as usize;
+            }
+            // Zero slack after the data, as after a mapped file.
+            std::ptr::write_bytes(self.ptr.add(n), 0, 192);
+            let at_eof = s0 + n == m.len;
+            // The last line of the chunk must end inside the buffer.
+            let tail = std::slice::from_raw_parts(self.ptr.add(end - 1 - s0), n - (end - 1 - s0));
+            if at_eof || tail.contains(&b'\n') {
+                return (Map { ptr: self.ptr, len: n, fd: -1 }, start - s0, end - s0);
+            }
+            want *= 2;
+        }
+    }
 }
