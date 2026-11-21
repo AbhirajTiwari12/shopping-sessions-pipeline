@@ -89,7 +89,7 @@ pub fn no_populate() -> bool {
     *V.get_or_init(|| std::env::var("NO_POPULATE").is_ok())
 }
 /// Whether big anonymous regions ask for transparent huge pages by default.
-pub const DEFAULT_HUGE: bool = true;
+pub const DEFAULT_HUGE: bool = false;
 pub fn no_huge() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| if DEFAULT_HUGE { std::env::var("NO_HUGE").is_ok() } else { std::env::var("FORCE_HUGE").is_err() })
