@@ -1071,7 +1071,7 @@ unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &Tabl
         let ing = parse_f1(d.add(f[3].0), f[3].1, &mut dc);
         let h = mix(key);
         let mut pe = Pending { key, user: 0, w: DEAD_W, slot: (h >> t.tshift) as usize, tag: h as u32, ingest: u32::MAX };
-        prefetch(t.table.p().add(pe.slot));
+        prefetch_w(t.table.p().add(pe.slot));
         if ing != INVALID {
             pe.ingest = (ing / 1000).clamp(0, (u32::MAX - 1) as i64) as u32;
         }

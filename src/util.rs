@@ -107,6 +107,19 @@ pub fn prefetch<T>(p: *const T) {
     }
 }
 
+/// Prefetch for writing: the line arrives exclusive, ready for a compare-and-swap.
+#[inline(always)]
+pub fn prefetch_w<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::asm!("prefetchw byte ptr [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pstl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags));
+    }
+}
+
 // ---------------------------------------------------------------- keys
 
 /// IDs of up to 9 ASCII bytes pack losslessly into 63 bits, in an order-preserving way.
