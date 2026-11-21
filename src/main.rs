@@ -95,7 +95,7 @@ impl LinkTable {
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
-        (mix(k) >> self.shift) as usize
+        (h1(k) >> self.shift) as usize
     }
     #[inline(always)]
     fn prefetch(&self, k: u64) {
@@ -690,7 +690,7 @@ fn main() {
                     for v in sub_cl.iter_mut() {
                         v.clear();
                     }
-                    let sub_of = |name: u64| -> usize { if sbits == 0 { 0 } else { ((mix(name) << pbits) >> (64 - sbits)) as usize } };
+                    let sub_of = |name: u64| -> usize { if sbits == 0 { 0 } else { ((h1(name) << pbits) >> (64 - sbits)) as usize } };
                     for t in ev_parts.iter() {
                         let l = &t.lists[p];
                         for (bi, &b) in l.iter().enumerate() {
@@ -1246,14 +1246,19 @@ impl LineSink for ClickSink<'_> {
     unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32) {
         let d = self.d;
         let (c0, c1, c2) = (base + *seps as usize, base + *seps.add(1) as usize, base + *seps.add(2) as usize);
-        let mut wq = 0usize;
-        let (s0, l0) = field!(d, wq, ls, c0);
-        let (s1, l1) = field!(d, wq, c0 + 1, c1);
-        let (s2, l2) = field!(d, wq, c1 + 1, c2);
-        let (s3, l3) = field!(d, wq, c2 + 1, nl);
-        if qc as usize != 2 * wq || l0 == 0 || l1 == 0 || l2 == 0 {
+        // A quote is syntax only around a whole field: the line is well formed when
+        // its quotes are exactly those of its wrapped fields.
+        let wq = wrapped!(d, ls, c0) + wrapped!(d, c0 + 1, c1) + wrapped!(d, c1 + 1, c2) + wrapped!(d, c2 + 1, nl);
+        if qc != 2 * wq {
             return;
         }
+        let (s0, l0) = field!(d, ls, c0);
+        let (s1, l1) = field!(d, c0 + 1, c1);
+        let (s2, l2) = field!(d, c1 + 1, c2);
+        if l0 == 0 || l1 == 0 || l2 == 0 {
+            return;
+        }
+        let (s3, l3) = field!(d, c2 + 1, nl);
         let ts = parse_ts(d.add(s3), l3, &mut self.dc);
         if ts < self.lo || ts >= self.ctx.we {
             return;
@@ -1273,7 +1278,7 @@ impl LineSink for ClickSink<'_> {
         for i in 0..self.np {
             let c = *self.pend.get_unchecked(i);
             let name = self.links.get(c.user);
-            let p = (mix(name) >> st.pshift) as usize;
+            let p = (h1(name) >> st.pshift) as usize;
             let cur = st.ccur.get_unchecked_mut(p);
             if cur.1 == 0 {
                 if st.cused % POP == 0 {
@@ -1322,7 +1327,7 @@ struct Pending {
 unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending) {
     let (name, p) = if pe.w != DEAD_W {
         let name = links.get(pe.user);
-        (name, (mix(name) >> st.pshift) as usize)
+        (name, (h1(name) >> st.pshift) as usize)
     } else {
         (0, st.nparts)
     };
@@ -1382,35 +1387,46 @@ impl LineSink for EvSink<'_> {
     unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32) {
         let d = self.d;
         let c = |k: usize| base + *seps.add(k) as usize;
-        let mut wq = 0usize;
-        let (s0, l0) = field!(d, wq, ls, c(0));
-        let (s1, l1) = field!(d, wq, c(0) + 1, c(1));
-        let (s2, l2) = field!(d, wq, c(1) + 1, c(2));
-        let (s3, l3) = field!(d, wq, c(2) + 1, c(3));
-        let (s4, l4) = field!(d, wq, c(3) + 1, c(4));
-        let (s5, l5) = field!(d, wq, c(4) + 1, c(5));
-        let (s6, l6) = field!(d, wq, c(5) + 1, nl);
-        if qc as usize != 2 * wq || l0 == 0 {
+        // A quote is syntax only around a whole field: the line is well formed when
+        // its quotes are exactly those of its wrapped fields.
+        let mut wq = 0u32;
+        let mut s = ls;
+        for k in 0..6 {
+            let e = c(k);
+            wq += wrapped!(d, s, e);
+            s = e + 1;
+        }
+        wq += wrapped!(d, s, nl);
+        if qc != 2 * wq {
+            return;
+        }
+        let (s0, l0) = field!(d, ls, c(0));
+        if l0 == 0 {
             return;
         }
         let (ws, we) = (self.ctx.ws, self.ctx.we);
         let t = self.t;
         let key = pack(d.add(s0), l0);
+        let (s3, l3) = field!(d, c(2) + 1, c(3));
         let ing = parse_f1(d.add(s3), l3, &mut self.dc);
-        let h = mix(key);
-        let mut pe = Pending { key, user: 0, w: DEAD_W, slot: (h >> t.tshift) as usize, tag: h as u32, ingest: u32::MAX };
+        let h = h1(key);
+        let mut pe = Pending { key, user: 0, w: DEAD_W, slot: (h >> t.tshift) as usize, tag: (h >> 7) as u32, ingest: u32::MAX };
         prefetch_w(t.table.p().add(pe.slot));
         if ing != INVALID {
-            pe.ingest = (ing / 1000).clamp(0, (u32::MAX - 1) as i64) as u32;
+            pe.ingest = ing.clamp(0, (u32::MAX - 1) as i64) as u32;
         }
         'v: {
+            let (s1, l1) = field!(d, c(0) + 1, c(1));
+            let (s5, l5) = field!(d, c(4) + 1, c(5));
             if ing == INVALID || l1 == 0 || l5 == 0 {
                 break 'v;
             }
+            let (s2, l2) = field!(d, c(1) + 1, c(2));
             let ts = parse_ts(d.add(s2), l2, &mut self.dc);
-            if ts < ws || ts >= we || ing - ts > DAY_MS {
+            if ts < ws || ts >= we || ing * 1000 - ts > DAY_MS {
                 break 'v;
             }
+            let (s4, l4) = field!(d, c(3) + 1, c(4));
             let tp = d.add(s4);
             let mut extra = 0u32;
             match l4 {
@@ -1424,6 +1440,7 @@ impl LineSink for EvSink<'_> {
                     if (tp as *const u64).read_unaligned() != u64::from_ne_bytes(*b"purchase") {
                         break 'v;
                     }
+                    let (s6, l6) = field!(d, c(5) + 1, nl);
                     let price = parse_price(d.add(s6), l6);
                     if price == 0 {
                         break 'v;

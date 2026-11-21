@@ -246,6 +246,13 @@ fn key_lt_slow(a: u64, b: u64) -> bool {
     x < y
 }
 
+/// One multiplication: the top bits are well mixed, which is all a slot or a
+/// partition number needs.
+#[inline(always)]
+pub fn h1(k: u64) -> u64 {
+    k.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 #[inline(always)]
 pub fn mix(k: u64) -> u64 {
     let mut h = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -439,12 +446,12 @@ unsafe fn parse_dt19(p: *const u8, dc: &mut DateCache) -> Option<i64> {
     Some(days * 86_400 + (h * 3600 + m * 60 + s) as i64)
 }
 
-/// Form F1 only, to milliseconds; `INVALID` otherwise.
+/// Form F1 only, to seconds; `INVALID` otherwise.
 #[inline(always)]
 pub unsafe fn parse_f1(p: *const u8, len: usize, dc: &mut DateCache) -> i64 {
     if len == 20 && *p.add(19) == b'Z' {
         if let Some(s) = parse_dt19(p, dc) {
-            return s * 1000;
+            return s;
         }
     }
     INVALID
@@ -806,6 +813,7 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
     let (mut ni, mut nn) = (0usize, 0usize);
     let (mut qrun, mut qprev) = (0u32, 0u32);
     let mut done_scan = false;
+    let mut last_nl_end = 0usize;
     loop {
         // Stage 1: separator positions for the next batch of input.
         let target = b + BATCH;
@@ -848,16 +856,12 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
                 *buf.qcum.as_mut_ptr().add(nn) = qrun + (q & ((1u64 << i) - 1)).count_ones();
                 nn += 1;
                 nm &= nm - 1;
+                last_nl_end = b + i as usize + 1;
             }
             qrun += q.count_ones();
             b += 64;
             // Lines that start at or after `end` belong to the next chunk.
-            if nn > 0 && base + *buf.nlp.as_ptr().add(nn - 1) as usize + 1 >= end {
-                done_scan = true;
-            }
-            if b > flen {
-                done_scan = true;
-            }
+            done_scan = last_nl_end >= end || b > flen;
         }
         // No stale entry may pass for a newline.
         for k in 0..8 {
@@ -899,14 +903,22 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
     }
 }
 
-/// One field of a line: strips the quotes around it and counts them in `$wq`.
-/// Gives (start, length).
+/// Whether the field `s..e` is wrapped in quotes.
+#[macro_export]
+macro_rules! wrapped {
+    ($d:expr, $s:expr, $e:expr) => {{
+        let (s, e): (usize, usize) = ($s, $e);
+        ((e - s >= 2) & (*$d.add(s) == b'"') & (*$d.add(e).sub(1) == b'"')) as u32
+    }};
+}
+
+/// One field of a line whose quotes are known to be well formed (every quote wraps a
+/// whole field), so a leading quote means the field is wrapped. Gives (start, length).
 #[macro_export]
 macro_rules! field {
-    ($d:expr, $wq:ident, $s:expr, $e:expr) => {{
+    ($d:expr, $s:expr, $e:expr) => {{
         let (s, e): (usize, usize) = ($s, $e);
-        let q = ((e - s >= 2) & (*$d.add(s) == b'"') & (*$d.add(e).sub(1) == b'"')) as usize;
-        $wq += q;
+        let q = (*$d.add(s) == b'"') as usize;
         (s + q, e - s - 2 * q)
     }};
 }
