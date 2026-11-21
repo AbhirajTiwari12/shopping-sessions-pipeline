@@ -1245,20 +1245,18 @@ impl LineSink for ClickSink<'_> {
     #[inline(always)]
     unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32) {
         let d = self.d;
-        let (c0, c1, c2) = (base + *seps as usize, base + *seps.add(1) as usize, base + *seps.add(2) as usize);
+        let _ = (ls, nl);
         // A quote is syntax only around a whole field: the line is well formed when
         // its quotes are exactly those of its wrapped fields.
-        let wq = wrapped!(d, ls, c0) + wrapped!(d, c0 + 1, c1) + wrapped!(d, c1 + 1, c2) + wrapped!(d, c2 + 1, nl);
-        if qc != 2 * wq {
+        let (mut st, mut ln) = ([0u32; 8], [0u32; 8]);
+        if qc != 2 * split_fields::<4>(d.add(base), seps, &mut st, &mut ln) {
             return;
         }
-        let (s0, l0) = field!(d, ls, c0);
-        let (s1, l1) = field!(d, c0 + 1, c1);
-        let (s2, l2) = field!(d, c1 + 1, c2);
+        let f = |k: usize| (base + st[k] as usize, ln[k] as usize);
+        let ((s0, l0), (s1, l1), (s2, l2), (s3, l3)) = (f(0), f(1), f(2), f(3));
         if l0 == 0 || l1 == 0 || l2 == 0 {
             return;
         }
-        let (s3, l3) = field!(d, c2 + 1, nl);
         let ts = parse_ts(d.add(s3), l3, &mut self.dc);
         if ts < self.lo || ts >= self.ctx.we {
             return;
@@ -1386,28 +1384,22 @@ impl LineSink for EvSink<'_> {
     #[inline(always)]
     unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32) {
         let d = self.d;
-        let c = |k: usize| base + *seps.add(k) as usize;
+        let _ = (ls, nl);
         // A quote is syntax only around a whole field: the line is well formed when
         // its quotes are exactly those of its wrapped fields.
-        let mut wq = 0u32;
-        let mut s = ls;
-        for k in 0..6 {
-            let e = c(k);
-            wq += wrapped!(d, s, e);
-            s = e + 1;
-        }
-        wq += wrapped!(d, s, nl);
-        if qc != 2 * wq {
+        let (mut st, mut ln) = ([0u32; 8], [0u32; 8]);
+        if qc != 2 * split_fields::<7>(d.add(base), seps, &mut st, &mut ln) {
             return;
         }
-        let (s0, l0) = field!(d, ls, c(0));
+        let f = |k: usize| (base + st[k] as usize, ln[k] as usize);
+        let (s0, l0) = f(0);
         if l0 == 0 {
             return;
         }
         let (ws, we) = (self.ctx.ws, self.ctx.we);
         let t = self.t;
         let key = pack(d.add(s0), l0);
-        let (s3, l3) = field!(d, c(2) + 1, c(3));
+        let (s3, l3) = f(3);
         let ing = parse_f1(d.add(s3), l3, &mut self.dc);
         let h = h1(key);
         let mut pe = Pending { key, user: 0, w: DEAD_W, slot: (h >> t.tshift) as usize, tag: (h >> 7) as u32, ingest: u32::MAX };
@@ -1416,17 +1408,17 @@ impl LineSink for EvSink<'_> {
             pe.ingest = ing.clamp(0, (u32::MAX - 1) as i64) as u32;
         }
         'v: {
-            let (s1, l1) = field!(d, c(0) + 1, c(1));
-            let (s5, l5) = field!(d, c(4) + 1, c(5));
+            let (s1, l1) = f(1);
+            let (s5, l5) = f(5);
             if ing == INVALID || l1 == 0 || l5 == 0 {
                 break 'v;
             }
-            let (s2, l2) = field!(d, c(1) + 1, c(2));
+            let (s2, l2) = f(2);
             let ts = parse_ts(d.add(s2), l2, &mut self.dc);
             if ts < ws || ts >= we || ing * 1000 - ts > DAY_MS {
                 break 'v;
             }
-            let (s4, l4) = field!(d, c(3) + 1, c(4));
+            let (s4, l4) = f(4);
             let tp = d.add(s4);
             let mut extra = 0u32;
             match l4 {
@@ -1440,7 +1432,7 @@ impl LineSink for EvSink<'_> {
                     if (tp as *const u64).read_unaligned() != u64::from_ne_bytes(*b"purchase") {
                         break 'v;
                     }
-                    let (s6, l6) = field!(d, c(5) + 1, nl);
+                    let (s6, l6) = f(6);
                     let price = parse_price(d.add(s6), l6);
                     if price == 0 {
                         break 'v;

@@ -777,7 +777,8 @@ impl ScanBuf {
 
 pub trait LineSink {
     /// A line with exactly the expected number of commas. `seps` points at the offsets
-    /// (relative to `base`) of its commas; the line spans `ls..nl` and holds `qc` quotes.
+    /// (relative to `base`) of its commas and its newline; the entry before them is the
+    /// separator that precedes the line. The line spans `ls..nl` and holds `qc` quotes.
     unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32);
     /// Called after the lines of a batch.
     unsafe fn flush(&mut self);
@@ -810,6 +811,9 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
     let base = line_start;
     b = line_start;
     let mut ls = line_start;
+    // Slot 0 of the index holds the separator before the first line of the batch
+    // (the previous newline); the separators proper start at slot 1.
+    *buf.idx.as_mut_ptr() = u32::MAX;
     let (mut ni, mut nn) = (0usize, 0usize);
     let (mut qrun, mut qprev) = (0u32, 0u32);
     let mut done_scan = false;
@@ -818,7 +822,7 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
         // Stage 1: separator positions for the next batch of input.
         let target = b + BATCH;
         while b < target && !done_scan {
-            if ni + 72 > buf.idx.len() {
+            if ni + 80 > buf.idx.len() {
                 let n = buf.idx.len() * 2;
                 buf.idx.resize(n, 0);
             }
@@ -835,7 +839,7 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
             let off = (b - base) as u32;
             let mut m = c | n;
             let cnt = m.count_ones() as usize;
-            let out = buf.idx.as_mut_ptr().add(ni);
+            let out = buf.idx.as_mut_ptr().add(1 + ni);
             // Eight unconditional scalar stores (kept out of the vectorizer's hands:
             // packing them into a vector costs more than the stores).
             for k in 0..8 {
@@ -867,10 +871,10 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
         }
         // No stale entry may pass for a newline.
         for k in 0..8 {
-            *buf.idx.as_mut_ptr().add(ni + k) = u32::MAX;
+            *buf.idx.as_mut_ptr().add(1 + ni + k) = u32::MAX;
         }
         // Stage 2: the lines.
-        let idx = buf.idx.as_ptr();
+        let idx = buf.idx.as_ptr().add(1);
         let mut ip = 0usize;
         let mut finished = false;
         for j in 0..nn {
@@ -899,7 +903,8 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
         }
         // Separators of the line still open move to the front.
         let rem = ni - ip;
-        std::ptr::copy(buf.idx.as_ptr().add(ip), buf.idx.as_mut_ptr(), rem);
+        std::ptr::copy(buf.idx.as_ptr().add(1 + ip), buf.idx.as_mut_ptr().add(1), rem);
+        *buf.idx.as_mut_ptr() = ((ls - base) as u32).wrapping_sub(1);
         ni = rem;
         nn = 0;
     }
@@ -923,4 +928,51 @@ macro_rules! field {
         let q = (*$d.add(s) == b'"') as usize;
         (s + q, e - s - 2 * q)
     }};
+}
+
+/// Splits a line of `K` fields. `seps[-1]` is the separator before the line and
+/// `seps[0..K]` those ending its fields, as offsets from `d`. Fills the start (offset
+/// from `d`) and length of every field, quotes stripped, and returns how many fields
+/// are wrapped in quotes: the line is well formed when its quotes are exactly twice that.
+#[inline(always)]
+pub unsafe fn split_fields<const K: usize>(d: *const u8, seps: *const u32, starts: &mut [u32; 8], lens: &mut [u32; 8]) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        const LANES: [i32; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let lanes = _mm256_loadu_si256(LANES.as_ptr().add(8 - K) as *const __m256i);
+        let p = _mm256_loadu_si256(seps.sub(1) as *const __m256i);
+        let e = _mm256_loadu_si256(seps as *const __m256i);
+        let one = _mm256_set1_epi32(1);
+        let fi = _mm256_add_epi32(p, one);
+        let la = _mm256_sub_epi32(e, one);
+        // First and last byte of every field at once.
+        let zero = _mm256_setzero_si256();
+        let first = _mm256_mask_i32gather_epi32::<1>(zero, d as *const i32, fi, lanes);
+        let last = _mm256_mask_i32gather_epi32::<1>(zero, d as *const i32, la, lanes);
+        let ff = _mm256_set1_epi32(0xFF);
+        let qt = _mm256_set1_epi32(0x22);
+        let fq = _mm256_cmpeq_epi32(_mm256_and_si256(first, ff), qt);
+        let lq = _mm256_cmpeq_epi32(_mm256_and_si256(last, ff), qt);
+        let len = _mm256_sub_epi32(e, fi);
+        // Wrapped: starts and ends with a quote and is not a lone quote.
+        let w = _mm256_and_si256(_mm256_andnot_si256(_mm256_cmpeq_epi32(len, one), _mm256_and_si256(fq, lq)), lanes);
+        _mm256_storeu_si256(starts.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(fi, w));
+        _mm256_storeu_si256(lens.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(len, _mm256_add_epi32(w, w)));
+        return (_mm256_movemask_ps(_mm256_castsi256_ps(w)) as u32).count_ones();
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let mut wq = 0u32;
+        for k in 0..K {
+            let s = (*seps.add(k).sub(1)).wrapping_add(1);
+            let e = *seps.add(k);
+            let len = e.wrapping_sub(s);
+            let q = ((len >= 2) & (*d.offset(s as i32 as isize) == b'"') & (*d.offset(e as i32 as isize - 1) == b'"')) as u32;
+            starts[k] = s + q;
+            lens[k] = len - 2 * q;
+            wq += q;
+        }
+        wq
+    }
 }
