@@ -492,6 +492,7 @@ fn main() {
     // Phase 2: parse events and clicks.
     let njobs = ev_chunks.len() + cl_chunks.len();
     let mut outs: Vec<ThreadOut>;
+    let table_region: (usize, usize);
     loop {
         let slots = 1usize << tbits;
         let table = P(alloc_zeroed::<AtomicU64>(slots));
@@ -560,6 +561,7 @@ fn main() {
             }
         });
         if !abort.load(Ordering::Relaxed) {
+            table_region = (table.p() as usize, slots * 8);
             break;
         }
         // The estimate was too low: start over with a bigger table.
@@ -724,6 +726,45 @@ fn main() {
     }
     lap("sessionize");
 
+    // Give the big mappings back on all threads while the last table is written, so
+    // the exit itself has little left to tear down.
+    #[allow(unused_mut)]
+    let mut releasers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if std::env::var("NO_RELEASE").is_err() {
+        let click_cap = cl_bytes / 8 + 16 + (nparts + 1) * BLK;
+        let mut regions: Vec<(usize, usize)> = vec![table_region, (links.e.p() as usize, (links.mask + 1) * 16)];
+        for o in outs.iter() {
+            regions.push((o.rows.p() as usize, row_cap * 32));
+            regions.push((o.crows.p() as usize, click_cap * 24));
+        }
+        for m in ev_files.iter().chain(cl_files.iter()).chain(ln_files.iter()) {
+            regions.push((m.ptr as usize, m.len));
+        }
+        const STEP: usize = 32 << 20;
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (p, len) in regions {
+            let (mut a, end) = (p & !0xFFF, (p + len + 0xFFF) & !0xFFF);
+            while a < end {
+                pieces.push((a, STEP.min(end - a)));
+                a += STEP;
+            }
+        }
+        let pieces = std::sync::Arc::new(pieces);
+        let next = std::sync::Arc::new(AtomicUsize::new(0));
+        for _ in 0..nthreads {
+            let (pieces, next) = (pieces.clone(), next.clone());
+            releasers.push(std::thread::spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= pieces.len() {
+                    break;
+                }
+                unsafe { libc::madvise(pieces[i].0 as *mut libc::c_void, pieces[i].1, libc::MADV_DONTNEED) };
+            }));
+        }
+    }
+    let _ = &table_region;
+
     // campaign_daily.
     let (mut ids, mut chans) = (Vec::new(), Vec::new());
     let (mut day, mut sess, mut purch, mut rev, mut asst) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -757,6 +798,9 @@ fn main() {
             Col::I64 { name: "assisted_sessions", data: &asst },
         ],
     );
+    for h in releasers {
+        let _ = h.join();
+    }
     lap("done");
     if verbose {
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
