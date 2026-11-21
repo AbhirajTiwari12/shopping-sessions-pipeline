@@ -768,25 +768,26 @@ pub struct ScanBuf {
     idx: Vec<u32>,
     nlp: Vec<u32>,
     qcum: Vec<u32>,
+    qidx: Vec<u32>,
 }
 impl ScanBuf {
     pub fn new() -> Self {
-        ScanBuf { idx: vec![0; BATCH * 2 + 256], nlp: vec![0; BATCH + 256], qcum: vec![0; BATCH + 256] }
+        ScanBuf { idx: vec![0; BATCH * 2 + 256], nlp: vec![0; BATCH + 256], qcum: vec![0; BATCH + 256], qidx: vec![0; BATCH * 2 + 256] }
     }
 }
 
 pub trait LineSink {
     /// A line with exactly the expected number of commas. `seps` points at the offsets
-    /// (relative to `base`) of its commas and its newline; the entry before them is the
-    /// separator that precedes the line. The line spans `ls..nl` and holds `qc` quotes.
-    unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32);
+    /// (relative to `d`) of its commas and its newline; the entry before them is the
+    /// separator that precedes the line. `quotes` are the offsets of its `qc` quotes.
+    unsafe fn line(&mut self, d: *const u8, seps: *const u32, quotes: *const u32, qc: u32);
     /// Called after the lines of a batch.
     unsafe fn flush(&mut self);
 }
 
 /// Like `scan_lines`, for lines of `K` fields, in two stages per batch: first the
-/// positions of all commas and newlines are written out, then each line is handed to
-/// the sink. Lines with another number of commas are skipped (they are malformed).
+/// positions of all commas, newlines and quotes are written out, then each line is
+/// handed to the sink. Lines with another number of commas are skipped (malformed).
 #[inline(always)]
 pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: usize, start: usize, end: usize, buf: &mut ScanBuf, sink: &mut S) {
     if flen == 0 || start >= flen {
@@ -809,17 +810,19 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
         return;
     }
     let base = line_start;
+    let d = data.add(base);
     b = line_start;
     let mut ls = line_start;
     // Slot 0 of the index holds the separator before the first line of the batch
     // (the previous newline); the separators proper start at slot 1.
     *buf.idx.as_mut_ptr() = u32::MAX;
-    let (mut ni, mut nn) = (0usize, 0usize);
-    let (mut qrun, mut qprev) = (0u32, 0u32);
+    let (mut ni, mut nn, mut nq) = (0usize, 0usize, 0usize);
+    // Quotes seen before the batch's first line, and before the last line handed out.
+    let (mut qbase, mut qprev) = (0u32, 0u32);
     let mut done_scan = false;
     let mut last_nl_end = 0usize;
     loop {
-        // Stage 1: separator positions for the next batch of input.
+        // Stage 1: separator and quote positions for the next batch of input.
         let target = b + BATCH;
         while b < target && !done_scan {
             if ni + 80 > buf.idx.len() {
@@ -830,6 +833,10 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
                 let n = buf.nlp.len() * 2;
                 buf.nlp.resize(n, 0);
                 buf.qcum.resize(n, 0);
+            }
+            if nq + 66 > buf.qidx.len() {
+                let n = buf.qidx.len() * 2;
+                buf.qidx.resize(n, 0);
             }
             let (c, q, mut n) = masks64(data.add(b));
             // The end of the file acts as a final newline.
@@ -855,16 +862,22 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
                 }
             }
             ni += cnt;
+            let qtot = qbase + nq as u32;
             let mut nm = n;
             while nm != 0 {
                 let i = nm.trailing_zeros();
                 *buf.nlp.as_mut_ptr().add(nn) = off + i;
-                *buf.qcum.as_mut_ptr().add(nn) = qrun + (q & ((1u64 << i) - 1)).count_ones();
+                *buf.qcum.as_mut_ptr().add(nn) = qtot + (q & ((1u64 << i) - 1)).count_ones();
                 nn += 1;
                 nm &= nm - 1;
                 last_nl_end = b + i as usize + 1;
             }
-            qrun += q.count_ones();
+            let mut qm = q;
+            while qm != 0 {
+                *buf.qidx.as_mut_ptr().add(nq) = off + qm.trailing_zeros();
+                nq += 1;
+                qm &= qm - 1;
+            }
             b += 64;
             // Lines that start at or after `end` belong to the next chunk.
             done_scan = last_nl_end >= end || b > flen;
@@ -875,6 +888,7 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
         }
         // Stage 2: the lines.
         let idx = buf.idx.as_ptr().add(1);
+        let qidx = buf.qidx.as_ptr();
         let mut ip = 0usize;
         let mut finished = false;
         for j in 0..nn {
@@ -883,11 +897,9 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
                 break;
             }
             let nlo = *buf.nlp.as_ptr().add(j);
-            let nl = base + nlo as usize;
-            let qc = *buf.qcum.as_ptr().add(j) - qprev;
-            qprev = *buf.qcum.as_ptr().add(j);
+            let qend = *buf.qcum.as_ptr().add(j);
             if *idx.add(ip + K - 1) == nlo {
-                sink.line(ls, idx.add(ip), base, nl, qc);
+                sink.line(d, idx.add(ip), qidx.add((qprev - qbase) as usize), qend - qprev);
                 ip += K;
             } else {
                 while *idx.add(ip) != nlo {
@@ -895,89 +907,58 @@ pub unsafe fn scan_batches<S: LineSink, const K: usize>(data: *const u8, flen: u
                 }
                 ip += 1;
             }
-            ls = nl + 1;
+            qprev = qend;
+            ls = base + nlo as usize + 1;
         }
         sink.flush();
         if finished || done_scan {
             break;
         }
-        // Separators of the line still open move to the front.
+        // Separators and quotes of the line still open move to the front.
         let rem = ni - ip;
         std::ptr::copy(buf.idx.as_ptr().add(1 + ip), buf.idx.as_mut_ptr().add(1), rem);
         *buf.idx.as_mut_ptr() = ((ls - base) as u32).wrapping_sub(1);
         ni = rem;
         nn = 0;
+        let used = (qprev - qbase) as usize;
+        std::ptr::copy(buf.qidx.as_ptr().add(used), buf.qidx.as_mut_ptr(), nq - used);
+        nq -= used;
+        qbase = qprev;
     }
-}
-
-/// Whether the field `s..e` is wrapped in quotes.
-#[macro_export]
-macro_rules! wrapped {
-    ($d:expr, $s:expr, $e:expr) => {{
-        let (s, e): (usize, usize) = ($s, $e);
-        ((e - s >= 2) & (*$d.add(s) == b'"') & (*$d.add(e).sub(1) == b'"')) as u32
-    }};
-}
-
-/// One field of a line whose quotes are known to be well formed (every quote wraps a
-/// whole field), so a leading quote means the field is wrapped. Gives (start, length).
-#[macro_export]
-macro_rules! field {
-    ($d:expr, $s:expr, $e:expr) => {{
-        let (s, e): (usize, usize) = ($s, $e);
-        let q = (*$d.add(s) == b'"') as usize;
-        (s + q, e - s - 2 * q)
-    }};
 }
 
 /// Splits a line of `K` fields. `seps[-1]` is the separator before the line and
-/// `seps[0..K]` those ending its fields, as offsets from `d`. Fills the start (offset
-/// from `d`) and length of every field, quotes stripped, and returns how many fields
-/// are wrapped in quotes: the line is well formed when its quotes are exactly twice that.
-/// Whether `split_fields` uses a vector gather. Gathers are slow on some CPUs (and
-/// mitigations make them slower on others), so the scalar walk is the default.
-pub const USE_GATHER: bool = false;
-
+/// `seps[0..K]` those ending its fields; `quotes` are its `qc` quotes, in order. Fills
+/// the start and length of every field with the quotes stripped. Returns false when a
+/// quote is anywhere but around a whole field (the line is malformed).
 #[inline(always)]
-pub unsafe fn split_fields<const K: usize>(d: *const u8, seps: *const u32, starts: &mut [u32; 8], lens: &mut [u32; 8]) -> u32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if USE_GATHER {
-        use std::arch::x86_64::*;
-        const LANES: [i32; 16] = [-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0];
-        let lanes = _mm256_loadu_si256(LANES.as_ptr().add(8 - K) as *const __m256i);
-        let p = _mm256_loadu_si256(seps.sub(1) as *const __m256i);
-        let e = _mm256_loadu_si256(seps as *const __m256i);
-        let one = _mm256_set1_epi32(1);
-        let fi = _mm256_add_epi32(p, one);
-        let la = _mm256_sub_epi32(e, one);
-        // First and last byte of every field at once.
-        let zero = _mm256_setzero_si256();
-        let first = _mm256_mask_i32gather_epi32::<1>(zero, d as *const i32, fi, lanes);
-        let last = _mm256_mask_i32gather_epi32::<1>(zero, d as *const i32, la, lanes);
-        let ff = _mm256_set1_epi32(0xFF);
-        let qt = _mm256_set1_epi32(0x22);
-        let fq = _mm256_cmpeq_epi32(_mm256_and_si256(first, ff), qt);
-        let lq = _mm256_cmpeq_epi32(_mm256_and_si256(last, ff), qt);
-        let len = _mm256_sub_epi32(e, fi);
-        // Wrapped: starts and ends with a quote and is not a lone quote.
-        let w = _mm256_and_si256(_mm256_andnot_si256(_mm256_cmpeq_epi32(len, one), _mm256_and_si256(fq, lq)), lanes);
-        _mm256_storeu_si256(starts.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(fi, w));
-        _mm256_storeu_si256(lens.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(len, _mm256_add_epi32(w, w)));
-        return (_mm256_movemask_ps(_mm256_castsi256_ps(w)) as u32).count_ones();
+pub unsafe fn split_fields<const K: usize>(seps: *const u32, quotes: *const u32, qc: u32, starts: &mut [u32; 8], lens: &mut [u32; 8]) -> bool {
+    for k in 0..8 {
+        let p = *seps.add(k).sub(1);
+        *starts.get_unchecked_mut(k) = p.wrapping_add(1);
+        *lens.get_unchecked_mut(k) = (*seps.add(k)).wrapping_sub(p).wrapping_sub(1);
     }
-    let mut wq = 0u32;
-    let mut p = *seps.sub(1);
-    for k in 0..K {
-        let e = *seps.add(k);
-        let s = p.wrapping_add(1);
-        let len = e.wrapping_sub(s);
-        // An empty field's "first byte" is its separator, never a quote; a lone quote
-        // is not a wrapper.
-        let q = ((*d.offset(s as i32 as isize) == b'"') & (*d.offset(e as i32 as isize - 1) == b'"') & (len != 1)) as u32;
-        *starts.get_unchecked_mut(k) = s + q;
-        *lens.get_unchecked_mut(k) = len - 2 * q;
-        wq += q;
-        p = e;
+    if qc == 0 {
+        return true;
     }
-    wq
+    if qc & 1 != 0 {
+        return false;
+    }
+    // Quotes come in pairs: one right after a separator, the next right before the
+    // separator that ends the same field.
+    let mut m = 0usize;
+    let mut i = 0usize;
+    while i < qc as usize {
+        let (qa, qb) = (*quotes.add(i), *quotes.add(i + 1));
+        while *seps.add(m) < qa {
+            m += 1;
+        }
+        if (*seps.add(m).sub(1)).wrapping_add(1) != qa || *seps.add(m) != qb + 1 {
+            return false;
+        }
+        *starts.get_unchecked_mut(m) += 1;
+        *lens.get_unchecked_mut(m) -= 2;
+        i += 2;
+    }
+    true
 }

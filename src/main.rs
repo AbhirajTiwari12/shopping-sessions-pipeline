@@ -1230,7 +1230,6 @@ impl PersonState {
 
 struct ClickSink<'a> {
     ctx: &'a Ctx,
-    d: *const u8,
     st: &'a mut EvState,
     links: &'a LinkTable,
     dc: DateCache,
@@ -1243,16 +1242,12 @@ const PEND: usize = 256;
 
 impl LineSink for ClickSink<'_> {
     #[inline(always)]
-    unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32) {
-        let d = self.d;
-        let _ = (ls, nl);
-        // A quote is syntax only around a whole field: the line is well formed when
-        // its quotes are exactly those of its wrapped fields.
+    unsafe fn line(&mut self, d: *const u8, seps: *const u32, quotes: *const u32, qc: u32) {
         let (mut st, mut ln) = ([0u32; 8], [0u32; 8]);
-        if qc != 2 * split_fields::<4>(d.add(base), seps, &mut st, &mut ln) {
+        if !split_fields::<4>(seps, quotes, qc, &mut st, &mut ln) {
             return;
         }
-        let f = |k: usize| (base + st[k] as usize, ln[k] as usize);
+        let f = |k: usize| (st[k] as usize, ln[k] as usize);
         let ((s0, l0), (s1, l1), (s2, l2), (s3, l3)) = (f(0), f(1), f(2), f(3));
         if l0 == 0 || l1 == 0 || l2 == 0 {
             return;
@@ -1299,7 +1294,6 @@ impl LineSink for ClickSink<'_> {
 unsafe fn parse_clicks(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, links: &LinkTable, buf: &mut ScanBuf) {
     let mut sink = ClickSink {
         ctx,
-        d: m.ptr,
         st,
         links,
         dc: DateCache::new(),
@@ -1375,7 +1369,6 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
 
 struct EvSink<'a> {
     ctx: &'a Ctx,
-    d: *const u8,
     st: &'a mut EvState,
     t: &'a TableCtx<'a>,
     links: &'a LinkTable,
@@ -1388,19 +1381,15 @@ struct EvSink<'a> {
 
 impl LineSink for EvSink<'_> {
     #[inline(always)]
-    unsafe fn line(&mut self, ls: usize, seps: *const u32, base: usize, nl: usize, qc: u32) {
-        let d = self.d;
-        let _ = (ls, nl);
+    unsafe fn line(&mut self, d: *const u8, seps: *const u32, quotes: *const u32, qc: u32) {
         if self.stage == 1 {
             return;
         }
-        // A quote is syntax only around a whole field: the line is well formed when
-        // its quotes are exactly those of its wrapped fields.
         let (mut st, mut ln) = ([0u32; 8], [0u32; 8]);
-        if qc != 2 * split_fields::<7>(d.add(base), seps, &mut st, &mut ln) {
+        if !split_fields::<7>(seps, quotes, qc, &mut st, &mut ln) {
             return;
         }
-        let f = |k: usize| (base + st[k] as usize, ln[k] as usize);
+        let f = |k: usize| (st[k] as usize, ln[k] as usize);
         let (s0, l0) = f(0);
         if l0 == 0 {
             return;
@@ -1478,7 +1467,6 @@ impl LineSink for EvSink<'_> {
 unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &TableCtx, links: &LinkTable, buf: &mut ScanBuf) {
     let mut sink = EvSink {
         ctx,
-        d: m.ptr,
         st,
         t,
         links,
