@@ -28,20 +28,21 @@ struct Chunk {
 }
 
 /// Rows are written in blocks of BLK per partition.
-const BLK: usize = 256;
+const BLK: usize = 512;
 const DEAD_W: u64 = u64::MAX;
 
-/// What dedup needs to know about a row.
+/// One event: the person and the packed time and purchase, then what dedup needs.
 #[repr(C)]
-struct DInfo {
+struct Row {
+    name: u64,
+    w: u64,
     key: u64,
     ingest: u32,
     best: u32,
 }
 
 struct EvState {
-    rows: P<[u64; 2]>,
-    dinfo: P<DInfo>,
+    rows: P<Row>,
     used: usize,
     cur: Vec<(usize, usize)>,
     lists: Vec<Vec<u32>>,
@@ -53,8 +54,7 @@ struct EvState {
 }
 
 struct ThreadOut {
-    rows: P<[u64; 2]>,
-    dinfo: P<DInfo>,
+    rows: P<Row>,
     lists: Vec<Vec<u32>>,
     left: Vec<u32>,
     dups: Vec<(u32, u32)>,
@@ -65,7 +65,7 @@ struct TableCtx<'a> {
     table: P<AtomicU64>,
     mask: usize,
     tshift: u32,
-    bases: &'a [P<DInfo>],
+    bases: &'a [P<Row>],
     lshift: u32,
     loc_base: u32,
 }
@@ -404,9 +404,14 @@ fn main() {
     if let Some(f) = std::env::var("FORCE_TBITS").ok().and_then(|v| v.parse::<u32>().ok()) {
         tbits = f.min(g_bits);
     }
-    let pbits = ((est.min(rec_bound) * 16 / (512 << 10)).max(1).next_power_of_two().trailing_zeros()).clamp(4, 12);
+    // Two levels of partitioning by person: a small fan-out while parsing, so every
+    // output stream stays in cache, and a second split just before sessionizing.
+    let est_rows = est.min(rec_bound).max(1);
+    let pbits = ((est_rows >> 16).max(1).next_power_of_two().trailing_zeros()).clamp(2, 7);
     let nparts = 1usize << pbits;
     let pshift = 64 - pbits;
+    let sbits = (((est_rows >> pbits) / 6000).max(1).next_power_of_two().trailing_zeros()).min(10);
+    let nsub = 1usize << sbits;
     if verbose {
         eprintln!("est {est} bound {rec_bound} tbits {tbits} g_bits {g_bits} nparts {nparts}");
     }
@@ -429,18 +434,16 @@ fn main() {
         let inserted = AtomicUsize::new(0);
         let abort = std::sync::atomic::AtomicBool::new(false);
         let next = AtomicUsize::new(0);
-        let rows: Vec<P<[u64; 2]>> = (0..nthreads).map(|_| P(alloc_zeroed::<[u64; 2]>(row_cap))).collect();
-        let dinfo: Vec<P<DInfo>> = (0..nthreads).map(|_| P(alloc_zeroed::<DInfo>(row_cap))).collect();
+        let rows: Vec<P<Row>> = (0..nthreads).map(|_| P(alloc_zeroed::<Row>(row_cap))).collect();
         outs = Vec::new();
         std::thread::scope(|sc| {
             let mut hs = Vec::new();
             for tid in 0..nthreads {
-                let (ctx, ev_chunks, cl_chunks, ev_files, cl_files, rows, dinfo, next, inserted, abort, links) =
-                    (&ctx, &ev_chunks, &cl_chunks, &ev_files, &cl_files, &rows, &dinfo, &next, &inserted, &abort, &links);
+                let (ctx, ev_chunks, cl_chunks, ev_files, cl_files, rows, next, inserted, abort, links) =
+                    (&ctx, &ev_chunks, &cl_chunks, &ev_files, &cl_files, &rows, &next, &inserted, &abort, &links);
                 hs.push(sc.spawn(move || {
                     let mut st = EvState {
                         rows: rows[tid],
-                        dinfo: dinfo[tid],
                         used: 0,
                         cur: vec![(0, 0); nparts + 1],
                         lists: (0..nparts + 1).map(|_| Vec::new()).collect(),
@@ -450,7 +453,7 @@ fn main() {
                         nparts,
                         pshift,
                     };
-                    let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, bases: dinfo, lshift, loc_base: (tid as u32) << lshift };
+                    let tctx = TableCtx { table, mask: slots - 1, tshift: 64 - tbits, bases: rows, lshift, loc_base: (tid as u32) << lshift };
                     loop {
                         let j = next.fetch_add(1, Ordering::Relaxed);
                         if j >= njobs || abort.load(Ordering::Relaxed) {
@@ -472,7 +475,6 @@ fn main() {
                     lap("worker");
                     ThreadOut {
                         rows: st.rows,
-                        dinfo: st.dinfo,
                         left: st.cur.iter().map(|c| c.1 as u32).collect(),
                         lists: st.lists,
                         dups: st.dups,
@@ -491,8 +493,7 @@ fn main() {
         unsafe {
             libc::munmap(table.p() as *mut libc::c_void, slots * 8);
             for t in 0..nthreads {
-                libc::munmap(rows[t].p() as *mut libc::c_void, row_cap * 16);
-                libc::munmap(dinfo[t].p() as *mut libc::c_void, row_cap * 16);
+                libc::munmap(rows[t].p() as *mut libc::c_void, row_cap * 32);
             }
         }
         tbits += 1;
@@ -506,10 +507,8 @@ fn main() {
         for w in 0..nthreads {
             let outs = &outs;
             sc.spawn(move || unsafe {
-                let di = |loc: u32| -> *mut DInfo { outs[(loc >> lshift) as usize].dinfo.p().add((loc & lmask) as usize) };
-                let kill = |loc: u32| {
-                    (*outs[(loc >> lshift) as usize].rows.p().add((loc & lmask) as usize))[1] = DEAD_W;
-                };
+                let di = |loc: u32| -> *mut Row { outs[(loc >> lshift) as usize].rows.p().add((loc & lmask) as usize) };
+                let kill = |loc: u32| (*di(loc)).w = DEAD_W;
                 for o in outs.iter() {
                     for &(first, me) in &o.dups {
                         if first as usize % nthreads != w {
@@ -546,7 +545,8 @@ fn main() {
                 let mut out = UserOut::default();
                 let mut st = PersonState::new(ncamp, cats.len());
                 let mut lm = LocalMap::new();
-                let mut segs: Vec<&[[u64; 2]]> = Vec::new();
+                let mut sub_ev: Vec<Vec<[u64; 2]>> = (0..nsub).map(|_| Vec::new()).collect();
+                let mut sub_cl: Vec<Vec<Click>> = (0..nsub).map(|_| Vec::new()).collect();
                 let mut names: Vec<u64> = Vec::new();
                 let mut off: Vec<u32> = Vec::new();
                 let mut coff: Vec<u32> = Vec::new();
@@ -559,28 +559,41 @@ fn main() {
                     if p >= nparts {
                         break;
                     }
-                    segs.clear();
+                    // Second split: by the next bits of the person's hash.
+                    for v in sub_ev.iter_mut() {
+                        v.clear();
+                    }
+                    for v in sub_cl.iter_mut() {
+                        v.clear();
+                    }
+                    let sub_of = |name: u64| -> usize { if sbits == 0 { 0 } else { ((mix(name) << pbits) >> (64 - sbits)) as usize } };
                     for t in ev_parts.iter() {
                         let l = &t.lists[p];
                         for (bi, &b) in l.iter().enumerate() {
                             let len = if bi + 1 == l.len() { BLK - t.left[p] as usize } else { BLK };
-                            segs.push(unsafe { std::slice::from_raw_parts(t.rows.p().add(b as usize) as *const [u64; 2], len) });
+                            let seg = unsafe { std::slice::from_raw_parts(t.rows.p().add(b as usize) as *const Row, len) };
+                            for r in seg {
+                                if r.w != DEAD_W {
+                                    unsafe { sub_ev.get_unchecked_mut(sub_of(r.name)).push([r.name, r.w]) };
+                                }
+                            }
+                        }
+                        for c in &t.clicks[p] {
+                            unsafe { sub_cl.get_unchecked_mut(sub_of(c.user)).push(*c) };
                         }
                     }
-                    if segs.is_empty() {
-                        continue;
-                    }
-                    // Dense person numbers within the partition, then a counting sort by person.
-                    let cap: usize = segs.iter().map(|x| x.len()).sum();
-                    lm.reset(cap / 4);
-                    names.clear();
-                    off.clear();
-                    ids.clear();
-                    for t in segs.iter() {
-                        for r in t.iter() {
-                            if r[1] == DEAD_W {
-                                continue;
-                            }
+                    for q in 0..nsub {
+                        let rows = &sub_ev[q];
+                        let n = rows.len();
+                        if n == 0 {
+                            continue;
+                        }
+                        // Dense person numbers, then a counting sort by person.
+                        lm.reset(n / 4);
+                        names.clear();
+                        off.clear();
+                        ids.clear();
+                        for r in rows.iter() {
                             let id = lm.get_or_insert(r[0], &mut names);
                             if id as usize == off.len() {
                                 off.push(0);
@@ -588,74 +601,59 @@ fn main() {
                             off[id as usize] += 1;
                             ids.push(id);
                         }
-                    }
-                    let n = ids.len();
-                    let np = names.len();
-                    let mut acc = 0u32;
-                    for o in off.iter_mut() {
-                        let c = *o;
-                        *o = acc;
-                        acc += c;
-                    }
-                    off.push(acc);
-                    ev.clear();
-                    ev.resize(n, 0);
-                    let mut i = 0;
-                    for t in segs.iter() {
-                        for r in t.iter() {
-                            if r[1] == DEAD_W {
-                                continue;
-                            }
-                            let id = ids[i] as usize;
-                            i += 1;
+                        let np = names.len();
+                        let mut acc = 0u32;
+                        for o in off.iter_mut() {
+                            let c = *o;
+                            *o = acc;
+                            acc += c;
+                        }
+                        off.push(acc);
+                        ev.clear();
+                        ev.resize(n, 0);
+                        for (r, &id) in rows.iter().zip(ids.iter()) {
+                            let id = id as usize;
                             ev[off[id] as usize] = r[1];
                             off[id] += 1;
                         }
-                    }
-                    // off[id] is now the end of person id, which is the start of id + 1.
-                    coff.clear();
-                    coff.resize(np + 1, 0);
-                    cids.clear();
-                    for t in ev_parts.iter() {
-                        for c in &t.clicks[p] {
+                        // off[id] is now the end of person id, which is the start of id + 1.
+                        coff.clear();
+                        coff.resize(np + 1, 0);
+                        cids.clear();
+                        for c in sub_cl[q].iter() {
                             let id = lm.get(c.user);
                             cids.push(id);
                             if id != u32::MAX {
                                 coff[id as usize] += 1;
                             }
                         }
-                    }
-                    let mut acc = 0u32;
-                    for o in coff.iter_mut() {
-                        let c = *o;
-                        *o = acc;
-                        acc += c;
-                    }
-                    cl.clear();
-                    cl.resize(acc as usize, Click { user: 0, ckey: 0, ts: 0, camp: 0 });
-                    let mut i = 0;
-                    for t in ev_parts.iter() {
-                        for c in &t.clicks[p] {
-                            let id = cids[i];
-                            i += 1;
+                        let mut acc = 0u32;
+                        for o in coff.iter_mut() {
+                            let c = *o;
+                            *o = acc;
+                            acc += c;
+                        }
+                        cl.clear();
+                        cl.resize(acc as usize, Click { user: 0, ckey: 0, ts: 0, camp: 0 });
+                        for (c, &id) in sub_cl[q].iter().zip(cids.iter()) {
                             if id != u32::MAX {
                                 cl[coff[id as usize] as usize] = *c;
                                 coff[id as usize] += 1;
                             }
                         }
-                    }
-                    let (mut es, mut cs) = (0usize, 0usize);
-                    for id in 0..np {
-                        let (ee, ce) = (off[id] as usize, coff[id] as usize);
-                        let e = &mut ev[es..ee];
-                        e.sort_unstable();
-                        let c = &mut cl[cs..ce];
-                        if c.len() > 1 {
-                            c.sort_unstable_by_key(|c| (c.ts, c.ckey));
+                        let (mut es, mut cs) = (0usize, 0usize);
+                        for id in 0..np {
+                            let (ee, ce) = (off[id] as usize, coff[id] as usize);
+                            let e = &mut ev[es..ee];
+                            e.sort_unstable();
+                            let c = &mut cl[cs..ce];
+                            if c.len() > 1 {
+                                c.sort_unstable_by_key(|c| (c.ts, c.ckey));
+                            }
+                            st.person(names[id], e, c, ws, day0, ndays, ncamp, &mut agg, &mut out);
+                            es = ee;
+                            cs = ce;
                         }
-                        st.person(names[id], e, c, ws, day0, ndays, ncamp, &mut agg, &mut out);
-                        es = ee;
-                        cs = ce;
                     }
                 }
                 let n = out.day.len();
@@ -873,7 +871,7 @@ impl PersonState {
         let mut k = 0;
         while k < m {
             let start = ev[k] >> 32;
-            let day = (ws + start as i64).div_euclid(DAY_MS);
+            let day = day0 + ((ws - day0 * DAY_MS) as u64 + start) as i64 / DAY_MS;
             if day != cur_day {
                 self.flush(cur_day, d_sessions, d_events, d_rev, out);
                 cur_day = day;
@@ -1030,8 +1028,7 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
     let idx = c.0;
     c.0 += 1;
     c.1 -= 1;
-    st.rows.p().add(idx).write([name, pe.w]);
-    st.dinfo.p().add(idx).write(DInfo { key: pe.key, ingest: pe.ingest, best: 0 });
+    st.rows.p().add(idx).write(Row { name, w: pe.w, key: pe.key, ingest: pe.ingest, best: 0 });
     st.inserted += 1;
     let loc = t.loc_base | idx as u32;
     let val = ((pe.tag as u64) << 32) | (loc as u64 + 1);
