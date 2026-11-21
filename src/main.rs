@@ -386,6 +386,8 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from));
+    // THREAD_DIV runs on a fraction of the CPUs (a measurement aid).
+    let nthreads = (nthreads / std::env::var("THREAD_DIV").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&d| d > 0).unwrap_or(DEFAULT_THREAD_DIV)).max(1);
     let verbose = std::env::var("VERBOSE").is_ok();
     let lap = |what: &str| {
         if verbose {
@@ -1670,3 +1672,5 @@ fn small_output() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("SMALL_OUT").map_or(DEFAULT_SMALL_OUT, |v| v != "0"))
 }
+
+const DEFAULT_THREAD_DIV: usize = 1;
