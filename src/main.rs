@@ -922,9 +922,23 @@ fn process_sub(sc: &mut Scratch, rows: &[[u64; 2]], clicks: &[Click], st: &mut P
     }
 }
 
-#[inline(never)]
+#[inline(always)]
 fn sort_times(e: &mut [u64]) {
-    e.sort_unstable();
+    let n = e.len();
+    if n > 24 {
+        e.sort_unstable();
+        return;
+    }
+    // Insertion sort: most people have a handful of events.
+    for i in 1..n {
+        let v = unsafe { *e.get_unchecked(i) };
+        let mut j = i;
+        while j > 0 && unsafe { *e.get_unchecked(j - 1) } > v {
+            unsafe { *e.get_unchecked_mut(j) = *e.get_unchecked(j - 1) };
+            j -= 1;
+        }
+        unsafe { *e.get_unchecked_mut(j) = v };
+    }
 }
 
 /// Person name to dense number within one partition.
@@ -1203,6 +1217,7 @@ impl PersonState {
     }
 }
 
+#[inline(never)]
 unsafe fn parse_clicks(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, links: &LinkTable) {
     let d = m.ptr;
     let mut dc = DateCache::new();
@@ -1310,6 +1325,7 @@ unsafe fn commit(st: &mut EvState, t: &TableCtx, links: &LinkTable, pe: Pending)
     }
 }
 
+#[inline(never)]
 unsafe fn parse_events(ctx: &Ctx, m: &Map, c: &Chunk, st: &mut EvState, t: &TableCtx, links: &LinkTable) {
     let d = m.ptr;
     let mut dc = DateCache::new();

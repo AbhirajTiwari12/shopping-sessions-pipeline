@@ -88,9 +88,11 @@ pub fn no_populate() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("NO_POPULATE").is_ok())
 }
+/// Whether big anonymous regions ask for transparent huge pages by default.
+pub const DEFAULT_HUGE: bool = true;
 pub fn no_huge() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("NO_HUGE").is_ok())
+    *V.get_or_init(|| if DEFAULT_HUGE { std::env::var("NO_HUGE").is_ok() } else { std::env::var("FORCE_HUGE").is_err() })
 }
 #[cfg(target_os = "linux")]
 const MAP_NORESERVE: i32 = libc::MAP_NORESERVE;
