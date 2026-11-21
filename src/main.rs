@@ -880,72 +880,91 @@ fn process_sub(sc: &mut Scratch, rows: &[[u64; 2]], clicks: &[Click], st: &mut P
     if n == 0 {
         return;
     }
-    // Dense person numbers, then a counting sort by person.
+    // Dense person numbers, then a counting sort by person. The buffers are sized for
+    // the worst case up front, so the loops index without checks.
     lm.reset(n / 4);
     names.clear();
     off.clear();
+    off.reserve(n + 1);
     ids.clear();
-    for r in rows.iter() {
-        let id = lm.get_or_insert(r[0], names);
-        if id as usize == off.len() {
-            off.push(0);
-        }
-        off[id as usize] += 1;
-        ids.push(id);
-    }
-    let np = names.len();
-    let mut acc = 0u32;
-    for o in off.iter_mut() {
-        let c = *o;
-        *o = acc;
-        acc += c;
-    }
-    off.push(acc);
+    ids.reserve(n);
     ev.clear();
     ev.reserve(n);
-    unsafe { ev.set_len(n) };
-    for (r, &id) in rows.iter().zip(ids.iter()) {
-        let id = id as usize;
-        ev[off[id] as usize] = r[1];
-        off[id] += 1;
-    }
-    // off[id] is now the end of person id, which is the start of id + 1.
-    coff.clear();
-    coff.resize(np + 1, 0);
-    cids.clear();
-    for c in clicks.iter() {
-        let id = lm.get(c.user);
-        cids.push(id);
-        if id != u32::MAX {
-            coff[id as usize] += 1;
+    unsafe {
+        let (offp, idp, evp) = (off.as_mut_ptr(), ids.as_mut_ptr(), ev.as_mut_ptr());
+        let mut np = 0usize;
+        for i in 0..n {
+            let id = lm.get_or_insert(rows.get_unchecked(i)[0], names) as usize;
+            if id == np {
+                *offp.add(np) = 0;
+                np += 1;
+            }
+            *offp.add(id) += 1;
+            *idp.add(i) = id as u32;
         }
-    }
-    let mut acc = 0u32;
-    for o in coff.iter_mut() {
-        let c = *o;
-        *o = acc;
-        acc += c;
-    }
-    cl.clear();
-    cl.resize(acc as usize, Click { user: 0, ckey: 0, ts: 0, camp: 0 });
-    for (c, &id) in clicks.iter().zip(cids.iter()) {
-        if id != u32::MAX {
-            cl[coff[id as usize] as usize] = *c;
-            coff[id as usize] += 1;
+        let mut acc = 0u32;
+        for j in 0..np {
+            let c = *offp.add(j);
+            *offp.add(j) = acc;
+            acc += c;
         }
-    }
-    let (mut es, mut cs) = (0usize, 0usize);
-    for id in 0..np {
-        let (ee, ce) = (off[id] as usize, coff[id] as usize);
-        let e = &mut ev[es..ee];
-        sort_times(e);
-        let c = &mut cl[cs..ce];
-        if c.len() > 1 {
-            c.sort_unstable_by_key(|c| (c.ts, c.ckey));
+        *offp.add(np) = acc;
+        off.set_len(np + 1);
+        ids.set_len(n);
+        ev.set_len(n);
+        for i in 0..n {
+            let o = offp.add(*idp.add(i) as usize);
+            *evp.add(*o as usize) = rows.get_unchecked(i)[1];
+            *o += 1;
         }
-        unsafe { st.person(names[id], e, c, env.ws, env.day0, env.ndays, env.ncamp, agg, out) };
-        es = ee;
-        cs = ce;
+        // off[id] is now the end of person id, which is the start of id + 1.
+        let nc = clicks.len();
+        coff.clear();
+        coff.resize(np + 1, 0);
+        cids.clear();
+        cids.reserve(nc);
+        let (coffp, cidp) = (coff.as_mut_ptr(), cids.as_mut_ptr());
+        let mut kept = 0u32;
+        for i in 0..nc {
+            let id = lm.get(clicks.get_unchecked(i).user);
+            *cidp.add(i) = id;
+            if id != u32::MAX {
+                *coffp.add(id as usize) += 1;
+                kept += 1;
+            }
+        }
+        cids.set_len(nc);
+        let mut acc = 0u32;
+        for j in 0..=np {
+            let c = *coffp.add(j);
+            *coffp.add(j) = acc;
+            acc += c;
+        }
+        cl.clear();
+        cl.reserve(kept as usize);
+        cl.set_len(kept as usize);
+        let clp = cl.as_mut_ptr();
+        for i in 0..nc {
+            let id = *cidp.add(i);
+            if id != u32::MAX {
+                let o = coffp.add(id as usize);
+                *clp.add(*o as usize) = *clicks.get_unchecked(i);
+                *o += 1;
+            }
+        }
+        let (mut es, mut cs) = (0usize, 0usize);
+        for id in 0..np {
+            let (ee, ce) = (*offp.add(id) as usize, *coffp.add(id) as usize);
+            let e = std::slice::from_raw_parts_mut(evp.add(es), ee - es);
+            sort_times(e);
+            let c = std::slice::from_raw_parts_mut(clp.add(cs), ce - cs);
+            if c.len() > 1 {
+                c.sort_unstable_by_key(|c| (c.ts, c.ckey));
+            }
+            st.person(*names.get_unchecked(id), e, c, env.ws, env.day0, env.ndays, env.ncamp, agg, out);
+            es = ee;
+            cs = ce;
+        }
     }
 }
 
@@ -968,38 +987,33 @@ fn sort_times(e: &mut [u64]) {
     }
 }
 
-/// Person name to dense number within one partition.
+/// Person name to dense number within one sub-partition.
 #[derive(Default)]
 struct LocalMap {
-    keys: Vec<u64>,
-    ids: Vec<u32>,
+    e: Vec<(u64, u32)>,
     mask: usize,
 }
 impl LocalMap {
-    fn new() -> Self {
-        LocalMap { keys: Vec::new(), ids: Vec::new(), mask: 0 }
-    }
     fn reset(&mut self, hint: usize) {
         let cap = hint.max(64).next_power_of_two();
-        self.keys.clear();
-        self.keys.resize(cap, 0);
-        self.ids.clear();
-        self.ids.resize(cap, 0);
+        self.e.clear();
+        self.e.resize(cap, (0, 0));
         self.mask = cap - 1;
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
-        (mix(k) >> 6) as usize & self.mask
+        // The top bits chose the partition; these are independent of them.
+        (h1(k) >> 12) as usize & self.mask
     }
     #[inline(always)]
     fn get(&self, k: u64) -> u32 {
         let mut i = self.slot(k);
         loop {
-            let c = self.keys[i];
-            if c == k {
-                return self.ids[i];
+            let c = unsafe { *self.e.get_unchecked(i) };
+            if c.0 == k {
+                return c.1;
             }
-            if c == 0 {
+            if c.0 == 0 {
                 return u32::MAX;
             }
             i = (i + 1) & self.mask;
@@ -1009,30 +1023,33 @@ impl LocalMap {
     fn get_or_insert(&mut self, k: u64, names: &mut Vec<u64>) -> u32 {
         let mut i = self.slot(k);
         loop {
-            let c = self.keys[i];
-            if c == k {
-                return self.ids[i];
+            let c = unsafe { *self.e.get_unchecked(i) };
+            if c.0 == k {
+                return c.1;
             }
-            if c == 0 {
+            if c.0 == 0 {
                 break;
             }
             i = (i + 1) & self.mask;
         }
+        self.insert_new(k, i, names)
+    }
+    #[cold]
+    #[inline(never)]
+    fn insert_new(&mut self, k: u64, i: usize, names: &mut Vec<u64>) -> u32 {
         let id = names.len() as u32;
         names.push(k);
         if names.len() * 2 > self.mask + 1 {
             self.reset((self.mask + 1) * 2);
             for (j, &nk) in names.iter().enumerate() {
                 let mut i = self.slot(nk);
-                while self.keys[i] != 0 {
+                while self.e[i].0 != 0 {
                     i = (i + 1) & self.mask;
                 }
-                self.keys[i] = nk;
-                self.ids[i] = j as u32;
+                self.e[i] = (nk, j as u32);
             }
         } else {
-            self.keys[i] = k;
-            self.ids[i] = id;
+            self.e[i] = (k, id);
         }
         id
     }
